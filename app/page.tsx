@@ -3,129 +3,22 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import maplibregl from "maplibre-gl";
-
-type Property = {
-  customerName: string;
-  address: string;
-  coords: [number, number];
-};
-
-type StopOption = {
-  customerName: string;
-  address: string;
-  coords: [number, number];
-  isCustom?: boolean;
-  isNursery?: boolean;
-};
+import { decodePolyline, getClosestPathIndex } from "@/lib/geo";
+import { nurseryStop, properties, startCoordsMap } from "@/lib/stops";
+import type {
+  AppRoute,
+  Coordinate,
+  RouteApiResponse,
+  RouteData,
+  StopOption,
+  TrafficAssessment,
+} from "@/lib/route-types";
 
 type SelectedStop = StopOption & {
   instanceId: string;
 };
 
-type RouteData = {
-  route_order: string[];
-  reason: string;
-};
-
-type RouteSegment = {
-  steps?: {
-    way_points?: number[];
-  }[];
-};
-
-type AppRoute = {
-  routes: {
-    geometry?: string | [number, number][];
-    segments?: RouteSegment[];
-  }[];
-};
-
-type RouteApiResponse = {
-  output?: RouteData;
-  orsRoute?: AppRoute;
-  error?: string;
-};
-
-const nurseryStop: StopOption & { isNursery?: boolean } = {
-  customerName: "Nursery",
-  address: "168 Heyers Mill Rd, Colts Neck, NJ 07722",
-  coords: [-74.187268, 40.301599],
-  isNursery: true,
-};
-
-const properties: Property[] = [
-  {customerName: "Averbach Family", address: "3 Zachary Way, Tinton Falls, NJ 07724", coords: [-74.03599, 40.2774]},
-  {customerName: "Colantoni Family", address: "11 Brandywine Ln, Colts Neck, NJ 07722", coords: [-74.139030, 40.311325]},
-  {customerName: "Eilenberg Family 1", address: "20 Springhouse Rd, Ocean, NJ 08712", coords: [-74.061508, 40.242782]},
-  {customerName: "Eilenberg Family 2", address: "39 Harvey Dr, Short Hills, NJ 07078", coords: [-74.340281, 40.743923]},
-  {customerName: "Fisher Family", address: "103 The Terrace, Seagirt, NJ 08750", coords: [-74.028897, 40.138017]},
-  {customerName: "Gerrity Family", address: "29 Clarksburg Rd, Millstone Township, NJ 08510", coords: [-74.293023, 40.316136]},
-  {customerName: "Koenig Family", address: "217 Beacon Blvd, Seagirt, NJ 08750", coords: [-74.032463, 40.137463]},
-  {customerName: "Laverda Family", address: "4 Polo Club Dr, Tinton Falls, NJ 07724", coords: [-74.075084, 40.313041,]},
-  {customerName: "Lerner Family", address: "44 Glenwood Rd, Colts Neck, NJ 07722", coords: [-74.219300, 40.339825,]},
-  {customerName: "MacDonald Family", address: "16 Bretwood Dr, Colts Neck, NJ 07722", coords: [-74.179607, 40.284531]},
-  {customerName: "Maizel Family", address: "120 Davis Ln, Red Bank, NJ 07701", coords: [-74.091161, 40.3483229]},
-  {customerName: "McKenna Family", address: "3 Williamsburg N, Colts Neck, NJ 07722", coords: [-74.185960, 40.291659,]},
-  {customerName: "Peake Family", address: "25 Wardell Ave, Rumson, NJ 07760", coords: [-74.026324, 40.345205,]},
-  {customerName: "Premtaj Family", address: "1058 Franklin Lakes Rd, Franklin Lakes, NJ 07417", coords: [-74.233561, 40.997836,]},
-  {customerName: "Sessa Family", address: "83 Hazel Dr, Freehold, NJ 07728", coords: [-74.313458, 40.246766,]},
-  {customerName: "Shannon Family", address: "6 Ocala Ct, Freehold, NJ 07728", coords: [-74.326666, 40.233590,]},
-  {customerName: "Wolosow Family", address: "41 Heather Dr, Manalapn, NJ 07726", coords: [-74.293023, 40.316136,]},
-  {customerName: "Centrastate Large Building", address: "901 West Main Street, Freehold, NJ 07728", coords: [-74.311356, 40.238205]},
-  {customerName: "Centrastate Small Building", address: "1001 West Main Street, Freehold, NJ 07728", coords: [-74.314860, 40.234696]},
-  {customerName: "Site One", address: "3 Industrial Ct, Freehold, NJ 07728", coords: [-74.232081, 40.230114]},
-];
-
-const startCoordsMap = new Map<string, [number, number]>([
-  ["168 Heyers Mill Rd, Colts Neck, NJ 07722", [-74.187268, 40.301599]],
-  ["475 South St, Morristown, NJ 07960", [-74.480619, 40.781894]],
-]);
-
-function getDistanceInFeet(
-  coord1: [number, number],
-  coord2: [number, number]
-): number {
-  const toRad = (value: number) => (value * Math.PI) / 180;
-
-  const [lng1, lat1] = coord1;
-  const [lng2, lat2] = coord2;
-
-  const R = 6371000;
-  const dLat = toRad(lat2 - lat1);
-  const dLng = toRad(lng2 - lng1);
-
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) *
-      Math.cos(toRad(lat2)) *
-      Math.sin(dLng / 2) *
-      Math.sin(dLng / 2);
-
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  const meters = R * c;
-
-  return meters * 3.28084;
-}
-
-function getClosestPathIndex(
-  point: [number, number],
-  path: [number, number][]
-): number {
-  if (path.length === 0) return 0;
-
-  let closestIndex = 0;
-  let minDistance = Infinity;
-
-  for (let i = 0; i < path.length; i++) {
-    const distance = getDistanceInFeet(point, path[i]);
-    if (distance < minDistance) {
-      minDistance = distance;
-      closestIndex = i;
-    }
-  }
-
-  return closestIndex;
-}
+type RouteMode = "single" | "full";
 
 export default function Home() {
   const router = useRouter();
@@ -134,6 +27,8 @@ export default function Home() {
   const [rebuildingRoute, setRebuildingRoute] = useState(false);
   const [start, setStart] = useState("168 Heyers Mill Rd, Colts Neck, NJ 07722");
   const [followTruck, setFollowTruck] = useState(false);
+  const [routeMode, setRouteMode] = useState<RouteMode>("single");
+  const [currentLocation, setCurrentLocation] = useState<Coordinate | null>(null);
   const truckAnimationRef = useRef<[number, number] | null>(null);
   const [currentLegIndex, setCurrentLegIndex] = useState(0);
   const [currentLegPath, setCurrentLegPath] = useState <[number, number][]>([]);
@@ -147,6 +42,7 @@ export default function Home() {
   const [isSearchingAddresses, setIsSearchingAddresses] = useState(false);
   const [orsRoute, setOrsRoute] = useState<AppRoute | null>(null);
   const [routeData, setRouteData] = useState<RouteData | null>(null);
+  const [trafficAssessment, setTrafficAssessment] = useState<TrafficAssessment | null>(null);
   const [routeNeedsRebuild, setRouteNeedsRebuild] = useState(false);
 
   const stopMap = useMemo(
@@ -237,7 +133,7 @@ export default function Home() {
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) return;
 
-    mapRef.current = new maplibregl.Map({
+    const map = new maplibregl.Map({
       container: mapContainerRef.current,
       style: {
         version: 8,
@@ -261,6 +157,10 @@ export default function Home() {
       zoom: 9,
     });
 
+    mapRef.current = map;
+
+    map.on("load", () => map.resize());
+
     return () => {
       mapRef.current?.remove();
       mapRef.current = null;
@@ -268,7 +168,7 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    if (!mapRef.current || !navigator.geolocation) return;
+    if (!navigator.geolocation) return;
 
     const watchId = navigator.geolocation.watchPosition(
       (position) => {
@@ -277,9 +177,13 @@ export default function Home() {
           position.coords.latitude,
         ];
 
+        setCurrentLocation(lngLat);
+
         if (currentLegPath.length > 1) {
           setCurrentLegProgressIndex(getClosestPathIndex(lngLat, currentLegPath));
         }
+
+        if (!mapRef.current) return;
 
         if (!truckMarkerRef.current) {
           truckMarkerRef.current = new maplibregl.Marker({ color: "blue" })
@@ -483,7 +387,7 @@ export default function Home() {
       });
     }
 
-    const startCoords = startCoordsMap.get(start);
+    const startCoords = routeMode === "full" ? startCoordsMap.get(start) : null;
 
     if (startCoords) {
       const startMarker = new maplibregl.Marker({ color: "green" })
@@ -514,7 +418,7 @@ export default function Home() {
 
       markersRef.current.push(stopMarker);
     });
-  }, [orsRoute, routeData, start, currentLegIndex, currentLegPath, currentLegProgressIndex, followTruck, stopMap]);
+  }, [orsRoute, routeData, start, routeMode, currentLegIndex, currentLegPath, currentLegProgressIndex, followTruck, stopMap]);
 
   useEffect(() => {
     const savedState = localStorage.getItem("crewRouteState");
@@ -526,6 +430,7 @@ export default function Home() {
       if (parsed.start) setStart(parsed.start);
       if (parsed.routeData) setRouteData(parsed.routeData);
       if (parsed.orsRoute) setOrsRoute(parsed.orsRoute);
+      if (parsed.trafficAssessment) setTrafficAssessment(parsed.trafficAssessment);
       if (typeof parsed.currentLegIndex === "number") {
         setCurrentLegIndex(parsed.currentLegIndex);
       }
@@ -534,6 +439,9 @@ export default function Home() {
       }
       if (Array.isArray(parsed.customStops)) {
         setCustomStops(parsed.customStops);
+      }
+      if (parsed.routeMode === "single" || parsed.routeMode === "full") {
+        setRouteMode(parsed.routeMode);
       }
     } catch (error) {
       console.error("Failed to restore route state:", error);
@@ -545,14 +453,16 @@ export default function Home() {
       start,
       routeData,
       orsRoute,
+      trafficAssessment,
       currentLegIndex,
       followTruck,
       customStops,
+      routeMode,
     };
 
     console.log("SAVING crewRouteState:", navigationState);
     localStorage.setItem("crewRouteState", JSON.stringify(navigationState));
-  }, [start, routeData, orsRoute, currentLegIndex, followTruck, customStops]);
+  }, [start, routeData, orsRoute, trafficAssessment, currentLegIndex, followTruck, customStops, routeMode]);
 
   const date = currentDateTime
     ? currentDateTime.toLocaleDateString()
@@ -582,6 +492,16 @@ export default function Home() {
   }, []);
 
   const testRoute = async () => {
+    if (selectedStops.length === 0) {
+      setError(routeMode === "single" ? "Select a destination before creating a route." : "Select at least one stop before optimizing.");
+      return;
+    }
+
+    if (routeMode === "single" && selectedStops.length !== 1) {
+      setError("Single stop mode routes to one destination at a time.");
+      return;
+    }
+
     setLoading(true);
     setFollowTruck(false);
     setCurrentLegIndex(0);
@@ -589,8 +509,15 @@ export default function Home() {
     setCurrentLegPath([]);
     setRouteData(null);
     setOrsRoute(null);
+    setTrafficAssessment(null);
     setRouteNeedsRebuild(false);
     setError("");
+
+    if (routeMode === "single" && !currentLocation) {
+      setLoading(false);
+      setError("Waiting for the iPad location before creating a route.");
+      return;
+    }
 
     const parsedStops = selectedStops.map((stop) => ({
       address: stop.address,
@@ -602,6 +529,9 @@ export default function Home() {
       time: time,
       start,
       stops: parsedStops,
+      preserveOrder: routeMode === "single",
+      originCoords: routeMode === "single" ? currentLocation : undefined,
+      returnToStart: routeMode === "full",
     };
 
     try {
@@ -620,8 +550,15 @@ export default function Home() {
         throw new Error(data.error || "API request failed.");
       }
 
-      setRouteData(data.output);
+      setRouteData({
+        ...data.output,
+        reason:
+          routeMode === "single"
+            ? "Single stop route from current iPad location."
+            : data.output.reason,
+      });
       setOrsRoute(data.orsRoute);
+      setTrafficAssessment(data.trafficAssessment ?? null);
       setRouteNeedsRebuild(false);
       setSelectedStops([]);
       console.log("ROUTE DATA BEING SET:", data.output);
@@ -681,6 +618,7 @@ export default function Home() {
 
       setRouteData(data.output);
       setOrsRoute(data.orsRoute);
+      setTrafficAssessment(data.trafficAssessment ?? null);
       setRouteNeedsRebuild(false);
     } catch (error: unknown) {
       setError(getErrorMessage(error));
@@ -688,46 +626,6 @@ export default function Home() {
       setRebuildingRoute(false);
     }
   };
-
-
-  function decodePolyline(encoded: string): [number, number][] {
-    let index = 0;
-    let lat = 0;
-    let lng = 0;
-    const coordinates: [number, number][] = [];
-
-    while (index < encoded.length) {
-      let shift = 0;
-      let result = 0;
-
-      while (true) {
-        const byte = encoded.charCodeAt(index++) - 63;
-        result |= (byte & 0x1f) << shift;
-        shift += 5;
-        if (byte < 0x20) break;
-      }
-
-      const deltaLat = result & 1 ? ~(result >> 1) : result >> 1;
-      lat += deltaLat;
-
-      shift = 0;
-      result = 0;
-
-      while (true) {
-        const byte = encoded.charCodeAt(index++) - 63;
-        result |= (byte & 0x1f) << shift;
-        shift += 5;
-        if (byte < 0x20) break;
-      }
-
-      const deltaLng = result & 1 ? ~(result >> 1) : result >> 1;
-      lng += deltaLng;
-
-      coordinates.push([lng / 1e5, lat / 1e5]);
-    }
-
-    return coordinates;
-  }
 
   function getErrorMessage(error: unknown): string {
     return error instanceof Error ? error.message : "Something went wrong...";
@@ -748,20 +646,65 @@ export default function Home() {
     (stop) => stop.address === nurseryStop.address
   ).length;
 
+  const setStopSelection = (stop: StopOption) => {
+    setRouteData(null);
+    setOrsRoute(null);
+    setRouteNeedsRebuild(false);
+    setError("");
+
+    if (routeMode === "single") {
+      setSelectedStops((prev) => {
+        const selected = prev[0]?.address === stop.address;
+        return selected ? [] : [createSelectedStop(stop)];
+      });
+      return;
+    }
+
+    setSelectedStops((prev) => {
+      const lastStop = prev[prev.length - 1];
+
+      if (lastStop?.address === stop.address) {
+        const lastMatchingIndex = [...prev]
+          .map((item, index) => ({ item, index }))
+          .filter(({ item }) => item.address === stop.address)
+          .pop()?.index;
+
+        if (lastMatchingIndex !== undefined) {
+          return prev.filter((_, index) => index !== lastMatchingIndex);
+        }
+
+        return prev;
+      }
+
+      return [...prev, createSelectedStop(stop)];
+    });
+  };
+
   return (
     <main className="min-h-screen bg-slate-100 px-4 py-8">
       <div className="mx-auto max-w-7xl">
         <div className="mb-8 rounded-2xl bg-gradient-to-r from-slate-900 to-slate-700 p-6 text-white shadow-lg">
           <h1 className="text-3xl font-bold tracking-tight">Crew Route Optimizer</h1>
           <p className="mt-2 text-sm text-slate-200">
-            Build routes, add custom stops, and launch navigation.
+            Route from the current iPad location or plan a full stop sequence.
           </p>
 
-          <div className="mt-6 grid gap-4 md:grid-cols-3">
+          <div className="mt-6 grid gap-4 md:grid-cols-4">
             <div className="rounded-xl bg-white/10 p-4 backdrop-blur-sm">
-              <p className="text-xs uppercase tracking-wide text-slate-300">Start Location</p>
-              <p className="mt-1 text-sm font-semibold text-white">{start}</p>
+              <p className="text-xs uppercase tracking-wide text-slate-300">Route Mode</p>
+              <p className="mt-1 text-sm font-semibold text-white">
+                {routeMode === "single" ? "Single Stop" : "Full Route"}
+              </p>
             </div>
+
+            {routeMode === "full" && (
+              <div className="rounded-xl bg-white/10 p-4 backdrop-blur-sm">
+                <p className="text-xs uppercase tracking-wide text-slate-300">
+                  Start Location
+                </p>
+                <p className="mt-1 text-sm font-semibold text-white">{start}</p>
+              </div>
+            )}
 
             <div className="rounded-xl bg-white/10 p-4 backdrop-blur-sm">
               <p className="text-xs uppercase tracking-wide text-slate-300">Current Date</p>
@@ -779,20 +722,51 @@ export default function Home() {
           <div className="space-y-6">
             <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
               <label className="mb-2 block text-sm font-semibold text-slate-700">
-                Start Location
+                Route Type
               </label>
-              <select
-                value={start}
-                onChange={(e) => setStart(e.target.value)}
-                className="w-full rounded-xl border border-slate-300 bg-white p-3 text-slate-800 shadow-sm"
-              >
-                <option value="168 Heyers Mill Rd, Colts Neck, NJ 07722">
-                  Nursery
-                </option>
-                <option value="475 South St, Morristown, NJ 07960">
-                  Morristown
-                </option>
-              </select>
+              <div className="grid grid-cols-2 gap-2 rounded-xl bg-slate-100 p-1">
+                {(["single", "full"] as const).map((mode) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => {
+                      setRouteMode(mode);
+                      setSelectedStops([]);
+                      setRouteData(null);
+                      setOrsRoute(null);
+                      setRouteNeedsRebuild(false);
+                      setError("");
+                    }}
+                    className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${
+                      routeMode === mode
+                        ? "bg-slate-900 text-white shadow-sm"
+                        : "bg-transparent text-slate-700 hover:bg-white"
+                    }`}
+                  >
+                    {mode === "single" ? "Single Stop" : "Full Route"}
+                  </button>
+                ))}
+              </div>
+
+              {routeMode === "full" && (
+                <>
+                  <label className="mt-6 mb-2 block text-sm font-semibold text-slate-700">
+                    Start Location
+                  </label>
+                  <select
+                    value={start}
+                    onChange={(e) => setStart(e.target.value)}
+                    className="w-full rounded-xl border border-slate-300 bg-white p-3 text-slate-800 shadow-sm"
+                  >
+                    <option value="168 Heyers Mill Rd, Colts Neck, NJ 07722">
+                      Nursery
+                    </option>
+                    <option value="475 South St, Morristown, NJ 07960">
+                      Morristown
+                    </option>
+                  </select>
+                </>
+              )}
 
               <label className="mt-6 mb-3 block text-sm font-semibold text-slate-700">
                 Add Custom Address
@@ -829,15 +803,7 @@ export default function Home() {
                               ? prev
                               : [...prev, suggestion]
                           );
-                          setSelectedStops((prev) => {
-                            const lastStop = prev[prev.length - 1];
-
-                            if (lastStop?.address === suggestion.address) {
-                              return prev;
-                            }
-
-                            return [...prev, createSelectedStop(suggestion)];
-                          });
+                          setStopSelection(suggestion);
 
                           setCustomAddressSearch("");
                           setCustomAddressSuggestions([]);
@@ -872,7 +838,7 @@ export default function Home() {
                           <button
                             type="button"
                             onClick={() => {
-                              setSelectedStops((prev) => [...prev, createSelectedStop(stop)]);
+                              setStopSelection(stop);
                             }}
                             className="rounded-lg bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-800"
                           >
@@ -902,34 +868,19 @@ export default function Home() {
               )}
 
               <label className="mt-6 mb-3 block text-sm font-semibold text-slate-700">
-                Select Properties
+                {routeMode === "single" ? "Choose Destination" : "Select Properties"}
               </label>
               <div className="mb-4">
                 <button
                   type="button"
-                  onClick={() => {
-                    setSelectedStops((prev) => {
-                      const lastStop = prev[prev.length - 1];
-
-                      if (lastStop?.address === nurseryStop.address) {
-                        const lastMatchingIndex = [...prev]
-                          .map((stop, index) => ({ stop, index }))
-                          .filter(({ stop }) => stop.address === nurseryStop.address)
-                          .pop()?.index;
-
-                        if (lastMatchingIndex !== undefined) {
-                          return prev.filter((_, index) => index !== lastMatchingIndex);
-                        }
-
-                        return prev;
-                      }
-
-                      return [...prev, createSelectedStop(nurseryStop)];
-                    });
-                  }}
+                  onClick={() => setStopSelection(nurseryStop)}
                   className="rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm font-semibold text-emerald-800 shadow-sm transition hover:bg-emerald-100"
                 >
-                  {`Add Nursery Stop${nurserySelectedCount > 0 ? ` (${nurserySelectedCount})` : ""}`}
+                  {routeMode === "single"
+                    ? selectedStops[0]?.address === nurseryStop.address
+                      ? "Nursery Selected"
+                      : "Route to Nursery"
+                    : `Add Nursery Stop${nurserySelectedCount > 0 ? ` (${nurserySelectedCount})` : ""}`}
                 </button>
               </div>
               <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
@@ -943,26 +894,7 @@ export default function Home() {
                     <button
                       key={property.address}
                       type="button"
-                      onClick={() => {
-                        setSelectedStops((prev) => {
-                          const lastStop = prev[prev.length - 1];
-
-                          if (lastStop?.address === property.address) {
-                            const lastMatchingIndex = [...prev]
-                              .map((stop, index) => ({ stop, index }))
-                              .filter(({ stop }) => stop.address === property.address)
-                              .pop()?.index;
-
-                            if (lastMatchingIndex !== undefined) {
-                              return prev.filter((_, index) => index !== lastMatchingIndex);
-                            }
-
-                            return prev;
-                          }
-
-                          return [...prev, createSelectedStop(property)];
-                        });
-                      }}
+                      onClick={() => setStopSelection(property)}
                       className={`rounded-xl border p-4 text-left shadow-sm transition ${
                         isSelected
                           ? "border-slate-900 bg-slate-900 text-white"
@@ -989,7 +921,9 @@ export default function Home() {
           <div className="space-y-6">
             <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
               <div className="flex items-center justify-between gap-3">
-                <h2 className="text-lg font-semibold text-slate-900">Selected Stops</h2>
+                <h2 className="text-lg font-semibold text-slate-900">
+                  {routeMode === "single" ? "Destination" : "Selected Stops"}
+                </h2>
                 <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-semibold text-slate-600">
                   {selectedStops.length}
                 </span>
@@ -997,7 +931,9 @@ export default function Home() {
 
               {selectedStops.length === 0 ? (
                 <p className="mt-4 text-sm text-slate-500">
-                  No stops selected yet.
+                  {routeMode === "single"
+                    ? "Choose one destination to route from the current iPad location."
+                    : "No stops selected yet."}
                 </p>
               ) : (
                 <div className="mt-4 space-y-2">
@@ -1040,16 +976,24 @@ export default function Home() {
             <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
               <h2 className="text-lg font-semibold text-slate-900">Route Actions</h2>
               <p className="mt-1 text-sm text-slate-500">
-                Optimize your selected stops and open turn by turn navigation.
+                {routeMode === "single"
+                  ? "Create a route from the current iPad location to the chosen destination."
+                  : "Optimize your selected stops and open turn by turn navigation."}
               </p>
 
               <div className="mt-6 flex flex-col gap-3">
                 <button
                   onClick={testRoute}
-                  disabled={loading}
+                  disabled={loading || selectedStops.length === 0}
                   className="rounded-xl bg-slate-900 px-4 py-3 font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  {loading ? "Optimizing..." : "Optimize Route"}
+                  {loading
+                    ? routeMode === "single"
+                      ? "Creating Route..."
+                      : "Optimizing..."
+                    : routeMode === "single"
+                      ? "Create Route"
+                      : "Optimize Route"}
                 </button>
 
                 <button
@@ -1070,9 +1014,9 @@ export default function Home() {
             {routeData && (
               <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
                 <h2 className="mb-3 text-lg font-semibold text-slate-900">
-                  Optimized Route
+                  {routeMode === "single" ? "Current Route" : "Optimized Route"}
                 </h2>
-                {routeNeedsRebuild && (
+                {routeMode === "full" && routeNeedsRebuild && (
                   <div className = "mb-4 rounded-xl border border-amber-300 bg-amber-50 p-3">
                   <p className="mb-4 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800">
                     Route order changed. Rebuild the route before opening navigation.
@@ -1113,7 +1057,8 @@ export default function Home() {
                             </div>
                           </div>
                         </div>
-                        <div className="mt-3 grid grid-cols-3 gap-2">
+                        {routeMode === "full" && (
+                          <div className="mt-3 grid grid-cols-3 gap-2">
                           <button
                             type="button"
                             disabled={index === 0}
@@ -1184,7 +1129,8 @@ export default function Home() {
                           >
                             Remove
                           </button>
-                        </div>
+                          </div>
+                        )}
                       </div>
                     );
                   })}
@@ -1194,6 +1140,36 @@ export default function Home() {
                     <strong>Reason:</strong> {routeData.reason}
                   </p>
                 </div>
+                {trafficAssessment && (
+                  <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-sm font-semibold text-slate-900">
+                        TomTom Traffic
+                      </p>
+                      <span
+                        className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
+                          trafficAssessment.status === "accepted"
+                            ? "bg-emerald-100 text-emerald-700"
+                            : trafficAssessment.status === "rejected"
+                              ? "bg-amber-100 text-amber-800"
+                              : "bg-slate-100 text-slate-600"
+                        }`}
+                      >
+                        {trafficAssessment.status}
+                      </span>
+                    </div>
+                    <p className="mt-2 text-sm text-slate-600">
+                      {trafficAssessment.reason}
+                    </p>
+                    {trafficAssessment.delayRatio !== null && (
+                      <p className="mt-1 text-xs text-slate-500">
+                        Delay: {Math.round((trafficAssessment.delaySeconds ?? 0) / 60)} min,
+                        {" "}
+                        {Math.round(trafficAssessment.delayRatio * 100)}% over no-traffic time
+                      </p>
+                    )}
+                  </div>
+                )}
               </div>
             )}
 

@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-
-type Coordinate = [number, number];
+import type { Coordinate } from "@/lib/route-types";
 
 type GeoapifyStep = {
   instruction?: {
@@ -52,6 +51,22 @@ type AppRoute = {
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown error";
+}
+
+function jsonError(message: string, status: number) {
+  return NextResponse.json({ success: false, error: message }, { status });
+}
+
+function isCoordinate(value: unknown): value is Coordinate {
+  return (
+    Array.isArray(value) &&
+    value.length === 2 &&
+    value.every((item) => typeof item === "number" && Number.isFinite(item)) &&
+    value[0] >= -180 &&
+    value[0] <= 180 &&
+    value[1] >= -90 &&
+    value[1] <= 90
+  );
 }
 
 function toGeoapifyWaypoints(coordinates: [number, number][]) {
@@ -135,6 +150,10 @@ function convertGeoapifyToAppRoute(geoapifyData: GeoapifyRouteResponse): AppRout
 }
 
 async function getGeoapifyRoute(coordinates: [number, number][]) {
+  if (!process.env.GEOAPIFY_API_KEY) {
+    throw new Error("Missing GEOAPIFY_API_KEY.");
+  }
+
   const waypoints = toGeoapifyWaypoints(coordinates);
 
   const url =
@@ -164,18 +183,19 @@ export async function POST(request: Request) {
   try {
     const body = await request.json();
     const { truckLocation, destination, heading } = body as {
-      truckLocation: [number, number];
-      destination: [number, number];
+      truckLocation: unknown;
+      destination: unknown;
       heading?: number | null;
     };
 
     console.log("REROUTE INPUT:", { truckLocation, destination, heading });
 
-    if (!truckLocation || !destination) {
-      return NextResponse.json(
-        { success: false, error: "Missing truckLocation or destination" },
-        { status: 400 }
-      );
+    if (!isCoordinate(truckLocation) || !isCoordinate(destination)) {
+      return jsonError("Missing or invalid truckLocation or destination.", 400);
+    }
+
+    if (!process.env.OPENROUTESERVICE_API_KEY && !process.env.GEOAPIFY_API_KEY) {
+      return jsonError("Missing routing API keys.", 500);
     }
 
     const orsResponse = await fetch(

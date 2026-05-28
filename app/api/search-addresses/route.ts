@@ -11,6 +11,7 @@ type AddressSearchResult = {
   customerName: string;
   address: string;
   coords: [number, number];
+  propertyType: "commercial";
   isCustom: true;
 };
 
@@ -54,6 +55,7 @@ export async function GET(request: Request) {
         customerName: item.name || "Custom Address",
         address: item.display_name,
         coords: [Number(item.lon), Number(item.lat)] as [number, number],
+        propertyType: "commercial" as const,
         isCustom: true as const,
       }))
       .filter((item) => {

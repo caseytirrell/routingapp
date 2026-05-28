@@ -3,48 +3,26 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import maplibregl from "maplibre-gl";
-
-type Property = {
-  customerName: string;
-  address: string;
-  coords: [number, number];
-};
-
-type RouteData = {
-  route_order: string[];
-  reason: string;
-};
-
-type RouteStep = {
-  instruction?: string | { text?: string };
-  name?: string;
-  way_points?: number[];
-  distance?: number;
-  duration?: number;
-};
-
-type RouteSegment = {
-  distance?: number;
-  duration?: number;
-  steps?: RouteStep[];
-};
-
-type Route = {
-  geometry: string | [number, number][];
-  segments?: RouteSegment[];
-  distance?: number;
-  duration?: number;
-};
-
-type AppRoute = {
-  routes: Route[];
-};
-
-type RouteApiResponse = {
-  output?: RouteData;
-  orsRoute?: AppRoute;
-  error?: string;
-};
+import {
+  decodePolyline,
+  getBearingBetweenPoints,
+  getClosestPathIndex,
+  getClosestPointOnPath,
+  getDistanceAlongPathInFeet,
+  getDistanceFromPathFeet,
+  getDistanceInFeet,
+  getUpcomingPathBearing,
+} from "@/lib/geo";
+import { properties, startCoordsMap } from "@/lib/stops";
+import type {
+  AppRoute,
+  Coordinate,
+  RouteApiResponse,
+  RouteData,
+  RouteSegment,
+  RouteStep,
+  StopOption,
+} from "@/lib/route-types";
 
 type WakeLockSentinelLike = {
   release: () => Promise<void>;
@@ -63,108 +41,9 @@ type SavedNavigationState = {
   orsRoute: AppRoute | null;
   currentLegIndex: number;
   followTruck: boolean;
+  routeMode?: "single" | "full";
   customStops?: StopOption[];
 };
-
-type StopOption = {
-  customerName: string;
-  address: string;
-  coords: [number, number];
-  isCustom?: boolean;
-};
-
-const properties: Property[] = [
-  {customerName: "Averbach Family", address: "3 Zachary Way, Tinton Falls, NJ 07724", coords: [-74.03599, 40.2774]},
-  {customerName: "Colantoni Family", address: "11 Brandywine Ln, Colts Neck, NJ 07722", coords: [-74.139030, 40.311325]},
-  {customerName: "Eilenberg Family 1", address: "20 Springhouse Rd, Ocean, NJ 08712", coords: [-74.061508, 40.242782]},
-  {customerName: "Eilenberg Family 2", address: "39 Harvey Dr, Short Hills, NJ 07078", coords: [-74.340281, 40.743923]},
-  {customerName: "Fisher Family", address: "103 The Terrace, Seagirt, NJ 08750", coords: [-74.028897, 40.138017]},
-  {customerName: "Gerrity Family", address: "29 Clarksburg Rd, Millstone Township, NJ 08510", coords: [-74.293023, 40.316136]},
-  {customerName: "Koenig Family", address: "217 Beacon Blvd, Seagirt, NJ 08750", coords: [-74.032463, 40.137463]},
-  {customerName: "Laverda Family", address: "4 Polo Club Dr, Tinton Falls, NJ 07724", coords: [-74.075084, 40.313041]},
-  {customerName: "Lerner Family", address: "44 Glenwood Rd, Colts Neck, NJ 07722", coords: [-74.219300, 40.339825]},
-  {customerName: "MacDonald Family", address: "16 Bretwood Dr, Colts Neck, NJ 07722", coords: [-74.179607, 40.284531]},
-  {customerName: "Maizel Family", address: "120 Davis Ln, Red Bank, NJ 07701", coords: [-74.091161, 40.3483229]},
-  {customerName: "McKenna Family", address: "3 Williamsburg N, Colts Neck, NJ 07722", coords: [-74.185960, 40.291659]},
-  {customerName: "Peake Family", address: "25 Wardell Ave, Rumson, NJ 07760", coords: [-74.026324, 40.345205]},
-  {customerName: "Premtaj Family", address: "1058 Franklin Lakes Rd, Franklin Lakes, NJ 07417", coords: [-74.233561, 40.997836]},
-  {customerName: "Sessa Family", address: "83 Hazel Dr, Freehold, NJ 07728", coords: [-74.313458, 40.246766]},
-  {customerName: "Shannon Family", address: "6 Ocala Ct, Freehold, NJ 07728", coords: [-74.326666, 40.233590]},
-  {customerName: "Wolosow Family", address: "41 Heather Dr, Manalapn, NJ 07726", coords: [-74.293023, 40.316136]},
-  {customerName: "Centrastate Large Building", address: "901 West Main Street, Freehold, NJ 07728", coords: [-74.311356, 40.238205]},
-  {customerName: "Centrastate Small Building", address: "1001 West Main Street, Freehold, NJ 07728", coords: [-74.314860, 40.234696]},
-  {customerName: "Site One", address: "3 Industrial Ct, Freehold, NJ 07728", coords: [-74.232081, 40.230114]},
-];
-
-const startCoordsMap = new Map<string, [number, number]>([
-  ["168 Heyers Mill Rd, Colts Neck, NJ 07722", [-74.187268, 40.301599]],
-  ["475 South St, Morristown, NJ 07960", [-74.480619, 40.781894]],
-]);
-
-function decodePolyline(encoded: string): [number, number][] {
-  let index = 0;
-  let lat = 0;
-  let lng = 0;
-  const coordinates: [number, number][] = [];
-
-  while (index < encoded.length) {
-    let shift = 0;
-    let result = 0;
-
-    while (true) {
-      const byte = encoded.charCodeAt(index++) - 63;
-      result |= (byte & 0x1f) << shift;
-      shift += 5;
-      if (byte < 0x20) break;
-    }
-
-    const deltaLat = result & 1 ? ~(result >> 1) : result >> 1;
-    lat += deltaLat;
-
-    shift = 0;
-    result = 0;
-
-    while (true) {
-      const byte = encoded.charCodeAt(index++) - 63;
-      result |= (byte & 0x1f) << shift;
-      shift += 5;
-      if (byte < 0x20) break;
-    }
-
-    const deltaLng = result & 1 ? ~(result >> 1) : result >> 1;
-    lng += deltaLng;
-
-    coordinates.push([lng / 1e5, lat / 1e5]);
-  }
-
-  return coordinates;
-}
-
-function getDistanceInFeet(
-  coord1: [number, number],
-  coord2: [number, number]
-): number {
-  const toRad = (value: number) => (value * Math.PI) / 180;
-
-  const [lng1, lat1] = coord1;
-  const [lng2, lat2] = coord2;
-
-  const R = 6371000;
-  const dLat = toRad(lat2 - lat1);
-  const dLng = toRad(lng2 - lng1);
-
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) *
-      Math.cos(toRad(lat2)) *
-      Math.sin(dLng / 2) *
-      Math.sin(dLng / 2);
-
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  const meters = R * c;
-
-  return meters * 3.28084;
-}
 
 function formatDistanceToNextStop(feet: number | null): string {
   if (feet === null) return "—";
@@ -199,205 +78,12 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown error";
 }
 
-function distanceFromPointToSegmentFeet(
-  point: [number, number],
-  start: [number, number],
-  end: [number, number]
-): number {
-  const toFeet = (lng: number, lat: number, refLat: number) => {
-    const feetPerDegreeLat = 364000;
-    const feetPerDegreeLng = 364000 * Math.cos((refLat * Math.PI) / 180);
-    return [lng * feetPerDegreeLng, lat * feetPerDegreeLat] as [number, number];
-  };
-
-  const refLat = point[1];
-  const [px, py] = toFeet(point[0], point[1], refLat);
-  const [x1, y1] = toFeet(start[0], start[1], refLat);
-  const [x2, y2] = toFeet(end[0], end[1], refLat);
-
-  const dx = x2 - x1;
-  const dy = y2 - y1;
-
-  if (dx === 0 && dy === 0) {
-    return Math.hypot(px - x1, py - y1);
-  }
-
-  const t = Math.max(
-    0,
-    Math.min(1, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy))
-  );
-  const projX = x1 + t * dx;
-  const projY = y1 + t * dy;
-
-  return Math.hypot(px - projX, py - projY);
-}
-
-function getDistanceFromPathFeet(
-  point: [number, number],
-  path: [number, number][]
-): number | null {
-  if (path.length < 2) return null;
-
-  let minDistance = Infinity;
-
-  for (let i = 0; i < path.length - 1; i++) {
-    const distance = distanceFromPointToSegmentFeet(point, path[i], path[i + 1]);
-    if (distance < minDistance) minDistance = distance;
-  }
-
-  return minDistance;
-}
-
-function getDistanceAlongPathInFeet(
-  path: [number, number][],
-  startIndex: number,
-  endIndex: number
-): number {
-  if (path.length < 2) return 0;
-
-  const safeStartIndex = Math.max(0, Math.min(startIndex, path.length - 1));
-  const safeEndIndex = Math.max(0, Math.min(endIndex, path.length - 1));
-
-  if (safeEndIndex <= safeStartIndex) return 0;
-
-  let totalFeet = 0;
-
-  for (let i = safeStartIndex; i < safeEndIndex; i++) {
-    totalFeet += getDistanceInFeet(path[i], path[i + 1]);
-  }
-
-  return totalFeet;
-}
-
-function getClosestPathIndex(
-  point: [number, number],
-  path: [number, number][]
-): number {
-  if (path.length === 0) return 0;
-
-  let closestIndex = 0;
-  let minDistance = Infinity;
-
-  for (let i = 0; i < path.length; i++) {
-    const distance = getDistanceInFeet(point, path[i]);
-    if (distance < minDistance) {
-      minDistance = distance;
-      closestIndex = i;
-    }
-  }
-
-  return closestIndex;
-}
-
-function getBearingBetweenPoints(
-  start: [number, number],
-  end: [number, number]
-): number {
-  const toRad = (deg: number) => (deg * Math.PI) / 180;
-  const toDeg = (rad: number) => (rad * 180) / Math.PI;
-
-  const [lng1, lat1] = start;
-  const [lng2, lat2] = end;
-
-  const phi1 = toRad(lat1);
-  const phi2 = toRad(lat2);
-  const lambda1 = toRad(lng1);
-  const lambda2 = toRad(lng2);
-
-  const y = Math.sin(lambda2 - lambda1) * Math.cos(phi2);
-  const x =
-    Math.cos(phi1) * Math.sin(phi2) -
-    Math.sin(phi1) * Math.cos(phi2) * Math.cos(lambda2 - lambda1);
-
-  return (toDeg(Math.atan2(y, x)) + 360) % 360;
-}
-
-function getUpcomingPathBearing(
-  path: [number, number][],
-  currentIndex: number
-): number | null {
-  if (path.length < 2) return null;
-
-  const safeIndex = Math.max(0, Math.min(currentIndex, path.length - 2));
-
-  for (let i = safeIndex; i < path.length - 1; i++) {
-    const start = path[i];
-    const end = path[i + 1];
-
-    if (start[0] !== end[0] || start[1] !== end[1]) {
-      return getBearingBetweenPoints(start, end);
-    }
-  }
-
-  return null;
-}
-
-function getClosestPointOnSegment(
-  point: [number, number],
-  start: [number, number],
-  end: [number, number]
-): [number, number] {
-  const refLat = point[1];
-  const feetPerDegreeLat = 364000;
-  const feetPerDegreeLng = 364000 * Math.cos((refLat * Math.PI) / 180);
-
-  const toFeet = ([lng, lat]: [number, number]) => [
-    lng * feetPerDegreeLng,
-    lat * feetPerDegreeLat,
-  ];
-
-  const toLngLat = ([x, y]: [number, number]): [number, number] => [
-    x / feetPerDegreeLng,
-    y / feetPerDegreeLat,
-  ];
-
-  const [px, py] = toFeet(point);
-  const [x1, y1] = toFeet(start);
-  const [x2, y2] = toFeet(end);
-
-  const dx = x2 - x1;
-  const dy = y2 - y1;
-
-  if (dx === 0 && dy === 0) {
-    return start;
-  }
-
-  const t = Math.max(
-    0,
-    Math.min(1, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy))
-  );
-
-  return toLngLat([x1 + t * dx, y1 + t * dy]);
-}
-
-function getClosestPointOnPath(
-  point: [number, number],
-  path: [number, number][]
-): [number, number] | null {
-  if (path.length < 2) return null;
-
-  let closestPoint: [number, number] | null = null;
-  let minDistance = Infinity;
-
-  for (let i = 0; i < path.length - 1; i++) {
-    const projectedPoint = getClosestPointOnSegment(point, path[i], path[i + 1]);
-    const distance = getDistanceInFeet(point, projectedPoint);
-
-    if (distance < minDistance) {
-      minDistance = distance;
-      closestPoint = projectedPoint;
-    }
-  }
-
-  return closestPoint;
-}
-
 function replaceCurrentLegInDisplayGeometry(
-  fullRouteGeometry: [number, number][],
+  fullRouteGeometry: Coordinate[],
   currentSegment: RouteSegment,
-  currentLegPath: [number, number][],
+  currentLegPath: Coordinate[],
   isCurrentLegRerouted: boolean
-): [number, number][] {
+): Coordinate[] {
   if (!isCurrentLegRerouted || currentLegPath.length < 2) {
     return fullRouteGeometry;
   }
@@ -418,6 +104,7 @@ function replaceCurrentLegInDisplayGeometry(
 export default function NavPage() {
   const router = useRouter();
   const [start, setStart] = useState("168 Heyers Mill Rd, Colts Neck, NJ 07722");
+  const [routeMode, setRouteMode] = useState<"single" | "full">("single");
   const [followTruck, setFollowTruck] = useState(true);
   const [mapReady, setMapReady] = useState(false);
   const [showAddStopMenu, setShowAddStopMenu] = useState(false);
@@ -438,6 +125,7 @@ export default function NavPage() {
   const [isSearchingAddStopAddresses, setIsSearchingAddStopAddresses] = useState(false);
   const [navigationStarted, setNavigationStarted] = useState(false);
   const [navigationPaused, setNavigationPaused] = useState(false);
+  const [navigationError, setNavigationError] = useState("");
 
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
@@ -447,6 +135,7 @@ export default function NavPage() {
   const previousTruckLocationRef = useRef<[number, number] | null>(null);
   const currentTruckHeadingRef = useRef<number | null>(null);
   const reroutedLegIndexRef = useRef<number | null>(null);
+  const reroutedLegOriginalSegmentRef = useRef<RouteSegment | null>(null);
 
 
 
@@ -556,6 +245,9 @@ export default function NavPage() {
       }
       if (typeof parsed.followTruck === "boolean") {
         setFollowTruck(parsed.followTruck);
+      }
+      if (parsed.routeMode === "single" || parsed.routeMode === "full") {
+        setRouteMode(parsed.routeMode);
       }
     } catch (error) {
       console.error("Failed to load navigation state:", error);
@@ -798,6 +490,7 @@ export default function NavPage() {
           type: errorNames[error.code] ?? "Unknown error",
           message: error.message,
         });
+        setNavigationError(`GPS error: ${errorNames[error.code] ?? error.message}`);
       },
       {
         enableHighAccuracy: true,
@@ -838,6 +531,7 @@ export default function NavPage() {
     setCurrentLegPath(defaultCurrentLegGeometry);
     setCurrentLegProgressIndex(0);
     reroutedLegIndexRef.current = null;
+    reroutedLegOriginalSegmentRef.current = null;
   }, [orsRoute, currentLegIndex, currentLegPath.length]);
 
   useEffect(() => {
@@ -858,12 +552,17 @@ export default function NavPage() {
 
     const currentLegGeometry = currentLegPath;
     if (currentLegGeometry.length < 2) return;
+    const isCurrentLegRerouted = reroutedLegIndexRef.current === currentLegIndex;
+    const segmentForDisplaySplice =
+      isCurrentLegRerouted && reroutedLegOriginalSegmentRef.current
+        ? reroutedLegOriginalSegmentRef.current
+        : currentSegment;
 
     const displayRouteGeometry = replaceCurrentLegInDisplayGeometry(
       fullRouteGeometry,
-      currentSegment,
+      segmentForDisplaySplice,
       currentLegGeometry,
-      reroutedLegIndexRef.current === currentLegIndex
+      isCurrentLegRerouted
     );
 
     const drivenGeometry = currentLegGeometry.slice(0, currentLegProgressIndex + 1);
@@ -1051,11 +750,12 @@ export default function NavPage() {
       orsRoute,
       currentLegIndex,
       followTruck,
+      routeMode,
       customStops: availableStops.filter((stop) => stop.isCustom),
     };
 
     localStorage.setItem("crewRouteState", JSON.stringify(navigationState));
-  }, [start, routeData, orsRoute, currentLegIndex, followTruck, availableStops]);
+  }, [start, routeData, orsRoute, currentLegIndex, followTruck, routeMode, availableStops]);
 
   const currentStopAddress = routeData?.route_order?.[currentLegIndex] ?? null;
 
@@ -1170,6 +870,7 @@ export default function NavPage() {
 
     try {
       setIsReOptimizing(true);
+      setNavigationError("");
 
       const res = await fetch("/api/test-openai", {
         method: "POST",
@@ -1183,7 +884,10 @@ export default function NavPage() {
             minute: "2-digit",
           }),
           start,
-          startCoords: truckLocation ?? undefined,
+          originCoords: truckLocation ?? undefined,
+          returnCoords: routeMode === "full" ? startCoordsMap.get(start) : undefined,
+          preserveOrder: routeMode === "single",
+          returnToStart: routeMode === "full",
           stops: remainingStops,
         }),
       });
@@ -1200,8 +904,9 @@ export default function NavPage() {
       setCurrentLegPath([]);
       setCurrentLegProgressIndex(0);
       setShowAddStopMenu(false);
+      setNavigationError("");
     } catch (error: unknown) {
-      console.error("Re optimize failed:", getErrorMessage(error));
+      setNavigationError(getErrorMessage(error));
     } finally {
       setIsReOptimizing(false);
       setAddingStopAddress(null);
@@ -1246,6 +951,7 @@ export default function NavPage() {
     try {
       setIsReOptimizing(true);
       setAddingStopAddress(property.address);
+      setNavigationError("");
       await new Promise((resolve) => setTimeout(resolve, 150));
 
       const res = await fetch("/api/test-openai", {
@@ -1260,7 +966,10 @@ export default function NavPage() {
             minute: "2-digit",
           }),
           start,
-          startCoords: truckLocation ?? undefined,
+          originCoords: truckLocation ?? undefined,
+          returnCoords: routeMode === "full" ? startCoordsMap.get(start) : undefined,
+          preserveOrder: routeMode === "single",
+          returnToStart: routeMode === "full",
           stops: updatedStops,
         }),
       });
@@ -1279,8 +988,9 @@ export default function NavPage() {
       setShowAddStopMenu(false);
       setAddStopSearch("");
       setAddStopSuggestions([]);
+      setNavigationError("");
     } catch (error: unknown) {
-      console.error("Add stop failed:", getErrorMessage(error));
+      setNavigationError(getErrorMessage(error));
     } finally {
       setIsReOptimizing(false);
     }
@@ -1318,8 +1028,10 @@ export default function NavPage() {
           : rerouteRoute.geometry;
 
       reroutedLegIndexRef.current = currentLegIndex;
+      reroutedLegOriginalSegmentRef.current = currentSegment;
       setCurrentLegPath(newPath);
       setCurrentLegProgressIndex(0);
+      setNavigationError("");
 
       const rerouteSegment = rerouteRoute.segments?.[0];
 
@@ -1344,11 +1056,11 @@ export default function NavPage() {
         });
       }
     } catch (error: unknown) {
-      console.error("Reroute failed:", getErrorMessage(error));
+      setNavigationError(getErrorMessage(error));
     } finally {
       setIsRerouting(false);
     }
-  }, [currentLegIndex, currentStopCoords, isRerouting, truckLocation]);
+  }, [currentLegIndex, currentSegment, currentStopCoords, isRerouting, truckLocation]);
 
   useEffect(() => {
     if (
@@ -1622,6 +1334,18 @@ export default function NavPage() {
               </div>
             </div>
           )}
+          {navigationError && (
+            <div className="mb-3 flex items-start justify-between gap-3 rounded-xl border border-red-300 bg-red-50 px-3 py-2 text-sm font-semibold text-red-700">
+              <span>{navigationError}</span>
+              <button
+                type="button"
+                onClick={() => setNavigationError("")}
+                className="shrink-0 rounded-md border border-red-200 bg-white px-2 py-0.5 text-xs text-red-700"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
           {arrivalSuggestionText && (
             <div className="mb-3 rounded-xl border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm font-semibold text-emerald-800">
               {arrivalSuggestionText}
@@ -1688,7 +1412,7 @@ export default function NavPage() {
                   return next;
                 });
               }}
-              className="rounded-2xl border border-slate-300 bg-emerald px-4 py-3 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-slate-50 sm:text-base"
+              className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-slate-50 sm:text-base"
             >
               Add Stop
             </button>
