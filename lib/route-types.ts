@@ -19,6 +19,14 @@ export type RouteData = {
   reason: string;
 };
 
+export type DayPlanState = {
+  start: string;
+  routeData: RouteData;
+  customStops?: StopOption[];
+  activeStopAddress?: string | null;
+  needsReoptimization?: boolean;
+};
+
 export type RouteStep = {
   instruction?: string | { text?: string };
   name?: string;

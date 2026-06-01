@@ -26,6 +26,7 @@ import { properties, startCoordsMap } from "@/lib/stops";
 import type {
   AppRoute,
   Coordinate,
+  DayPlanState,
   RouteApiResponse,
   RouteData,
   RouteSegment,
@@ -52,7 +53,10 @@ type SavedNavigationState = {
   followTruck: boolean;
   routeMode?: "single" | "full";
   customStops?: StopOption[];
+  dayPlanStopAddress?: string;
 };
+
+const DAY_PLAN_STORAGE_KEY = "crewDayPlanState";
 
 function formatDistanceToNextStop(feet: number | null): string {
   if (feet === null) return "—";
@@ -63,6 +67,13 @@ function formatDistanceToNextStop(feet: number | null): string {
 
   const miles = feet / 5280;
   return `${miles.toFixed(1)} mi`;
+}
+
+function formatEtaTime(date: Date, language: AppLanguage): string {
+  return new Intl.DateTimeFormat(language === "es" ? "es-US" : "en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(date);
 }
 
 function getStepInstructionText(step: RouteStep | null): string | null {
@@ -116,9 +127,7 @@ export default function NavPage() {
   const [routeMode, setRouteMode] = useState<"single" | "full">("single");
   const [followTruck, setFollowTruck] = useState(true);
   const [mapReady, setMapReady] = useState(false);
-  const [showAddStopMenu, setShowAddStopMenu] = useState(false);
   const [availableStops, setAvailableStops] = useState<StopOption[]>(properties);
-  const [isReOptimizing, setIsReOptimizing] = useState(false);
   const [truckLocation, setTruckLocation] = useState<[number, number] | null>(null);
   const truckAnimationRef = useRef<[number, number] | null>(null);
   const [currentLegIndex, setCurrentLegIndex] = useState(0);
@@ -128,13 +137,11 @@ export default function NavPage() {
   const [currentLegProgressIndex, setCurrentLegProgressIndex] = useState(0);
   const [orsRoute, setOrsRoute] = useState<AppRoute | null>(null);
   const [routeData, setRouteData] = useState<RouteData | null>(null);
-  const [addingStopAddress, setAddingStopAddress] = useState<string | null>(null);
-  const [addStopSearch, setAddStopSearch] = useState("");
-  const [addStopSuggestions, setAddStopSuggestions] = useState<StopOption[]>([]);
-  const [isSearchingAddStopAddresses, setIsSearchingAddStopAddresses] = useState(false);
   const [navigationStarted, setNavigationStarted] = useState(false);
   const [navigationPaused, setNavigationPaused] = useState(false);
   const [navigationError, setNavigationError] = useState("");
+  const [currentDateTime, setCurrentDateTime] = useState(() => new Date());
+  const [dayPlanStopAddress, setDayPlanStopAddress] = useState<string | null>(null);
   const [language, setLanguage] = useState<AppLanguage>("en");
   const t = navText[language];
 
@@ -180,6 +187,14 @@ export default function NavPage() {
   }, [language]);
 
   useEffect(() => {
+    const interval = setInterval(() => {
+      setCurrentDateTime(new Date());
+    }, 30000);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
     setLanguage(normalizeLanguage(localStorage.getItem(LANGUAGE_STORAGE_KEY)));
 
     const handleLanguageChange = (event: Event) => {
@@ -197,59 +212,6 @@ export default function NavPage() {
       window.removeEventListener("storage", handleLanguageChange);
     };
   }, []);
-
-  useEffect(() => {
-    const query = addStopSearch.trim();
-
-    if (query.length < 3) {
-      setAddStopSuggestions([]);
-      setIsSearchingAddStopAddresses(false);
-      return;
-    }
-
-    let isCancelled = false;
-
-    const timeout = setTimeout(async () => {
-      try {
-        setIsSearchingAddStopAddresses(true);
-
-        const res = await fetch(
-          `/api/search-addresses?q=${encodeURIComponent(query)}`
-        );
-
-        const data = await res.json();
-
-        if (!res.ok) {
-          throw new Error(data.error || "Address search failed");
-        }
-
-        if (isCancelled) return;
-
-        const existingAddresses = new Set(
-          availableStops.map((stop) => stop.address.toLowerCase())
-        );
-
-        const filteredResults = (data.results || []).filter(
-          (item: StopOption) => !existingAddresses.has(item.address.toLowerCase())
-        );
-
-        setAddStopSuggestions(filteredResults);
-      } catch {
-        if (!isCancelled) {
-          setAddStopSuggestions([]);
-        }
-      } finally {
-        if (!isCancelled) {
-          setIsSearchingAddStopAddresses(false);
-        }
-      }
-    }, 350);
-
-    return () => {
-      isCancelled = true;
-      clearTimeout(timeout);
-    };
-  }, [addStopSearch, availableStops]);
 
   useEffect(() => {
     const saved = localStorage.getItem("crewRouteState");
@@ -291,6 +253,9 @@ export default function NavPage() {
       }
       if (parsed.routeMode === "single" || parsed.routeMode === "full") {
         setRouteMode(parsed.routeMode);
+      }
+      if (parsed.dayPlanStopAddress) {
+        setDayPlanStopAddress(parsed.dayPlanStopAddress);
       }
     } catch (error) {
       console.error("Failed to load navigation state:", error);
@@ -795,10 +760,11 @@ export default function NavPage() {
       followTruck,
       routeMode,
       customStops: availableStops.filter((stop) => stop.isCustom),
+      dayPlanStopAddress,
     };
 
     localStorage.setItem("crewRouteState", JSON.stringify(navigationState));
-  }, [start, routeData, orsRoute, currentLegIndex, followTruck, routeMode, availableStops]);
+  }, [start, routeData, orsRoute, currentLegIndex, followTruck, routeMode, availableStops, dayPlanStopAddress]);
 
   const currentStopAddress = routeData?.route_order?.[currentLegIndex] ?? null;
 
@@ -829,6 +795,36 @@ export default function NavPage() {
         : null;
 
   const currentSegment = orsRoute?.routes?.[0]?.segments?.[currentLegIndex] ?? null;
+  const remainingCurrentLegSeconds = useMemo(() => {
+    if (typeof currentSegment?.duration !== "number") return null;
+
+    const totalCurrentLegFeet = getDistanceAlongPathInFeet(
+      currentLegPath,
+      0,
+      currentLegPath.length - 1
+    );
+    const remainingCurrentLegFeet = getDistanceAlongPathInFeet(
+      currentLegPath,
+      currentLegProgressIndex,
+      currentLegPath.length - 1
+    );
+    const remainingCurrentLegRatio =
+      totalCurrentLegFeet > 0
+        ? Math.min(Math.max(remainingCurrentLegFeet / totalCurrentLegFeet, 0), 1)
+        : 1;
+
+    return currentSegment.duration * remainingCurrentLegRatio;
+  }, [currentLegPath, currentLegProgressIndex, currentSegment]);
+  const etaLabel =
+    remainingCurrentLegSeconds === null
+      ? null
+      : t.etaToNextStop(
+          formatEtaTime(
+            new Date(currentDateTime.getTime() + remainingCurrentLegSeconds * 1000),
+            language
+          ),
+          Math.max(0, Math.round(remainingCurrentLegSeconds / 60))
+        );
 
   const currentSteps = currentSegment?.steps ?? [];
   const currentLegStartIndex = currentSteps?.[0]?.way_points?.[0] ?? 0;
@@ -901,69 +897,6 @@ export default function NavPage() {
       ? getDistanceFromPathFeet(truckLocation, currentLegPath)
       : null;
 
-  const reOptimizeRemainingRoute = async () => {
-    if (!routeData?.route_order?.length) return;
-
-    const remainingAddresses = routeData.route_order.slice(currentLegIndex);
-
-    if (remainingAddresses.length === 0) return;
-
-    const remainingStops = remainingAddresses
-      .map((address) => {
-        const coords = stopMap.get(address);
-        if (!coords) return null;
-        return { address, coords };
-      })
-      .filter(Boolean) as { address: string; coords: [number, number] }[];
-
-    if (remainingStops.length === 0) return;
-
-    try {
-      setIsReOptimizing(true);
-      setNavigationError("");
-
-      const res = await fetch("/api/test-openai", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          date: new Date().toLocaleDateString(),
-          time: new Date().toLocaleTimeString([], {
-            hour: "numeric",
-            minute: "2-digit",
-          }),
-          start,
-          originCoords: truckLocation ?? undefined,
-          returnCoords: routeMode === "full" ? startCoordsMap.get(start) : undefined,
-          preserveOrder: routeMode === "single",
-          returnToStart: routeMode === "full",
-          stops: remainingStops,
-          language,
-        }),
-      });
-
-      const data = (await res.json()) as RouteApiResponse;
-
-      if (!res.ok || !data.output || !data.orsRoute?.routes?.[0]) {
-        throw new Error(data.error || "Failed to re optimize route.");
-      }
-
-      setRouteData(data.output);
-      setOrsRoute(data.orsRoute);
-      setCurrentLegIndex(0);
-      setCurrentLegPath([]);
-      setCurrentLegProgressIndex(0);
-      setShowAddStopMenu(false);
-      setNavigationError("");
-    } catch (error: unknown) {
-      setNavigationError(getErrorMessage(error));
-    } finally {
-      setIsReOptimizing(false);
-      setAddingStopAddress(null);
-    }
-  };
-
   useEffect(() => {
     if (!mapRef.current) return;
 
@@ -979,74 +912,6 @@ export default function NavPage() {
       clearTimeout(t3);
     };
   }, []);
-
-  const handleAddStopToRoute = async (property: StopOption) => {
-    if (!routeData) return;
-
-    const remainingAddresses = routeData.route_order.slice(currentLegIndex);
-    const updatedAddresses = [...remainingAddresses, property.address];
-
-    const updatedStops = updatedAddresses
-      .map((address) => {
-        const coords =
-          address === property.address ? property.coords : stopMap.get(address);
-
-        if (!coords) return null;
-
-        return { address, coords };
-      })
-      .filter(Boolean) as { address: string; coords: [number, number] }[];
-
-    if (updatedStops.length === 0) return;
-
-    try {
-      setIsReOptimizing(true);
-      setAddingStopAddress(property.address);
-      setNavigationError("");
-      await new Promise((resolve) => setTimeout(resolve, 150));
-
-      const res = await fetch("/api/test-openai", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          date: new Date().toLocaleDateString(),
-          time: new Date().toLocaleTimeString([], {
-            hour: "numeric",
-            minute: "2-digit",
-          }),
-          start,
-          originCoords: truckLocation ?? undefined,
-          returnCoords: routeMode === "full" ? startCoordsMap.get(start) : undefined,
-          preserveOrder: routeMode === "single",
-          returnToStart: routeMode === "full",
-          stops: updatedStops,
-          language,
-        }),
-      });
-
-      const data = (await res.json()) as RouteApiResponse;
-
-      if (!res.ok || !data.output || !data.orsRoute?.routes?.[0]) {
-        throw new Error(data.error || "Failed to add stop.");
-      }
-
-      setRouteData(data.output);
-      setOrsRoute(data.orsRoute);
-      setCurrentLegIndex(0);
-      setCurrentLegPath([]);
-      setCurrentLegProgressIndex(0);
-      setShowAddStopMenu(false);
-      setAddStopSearch("");
-      setAddStopSuggestions([]);
-      setNavigationError("");
-    } catch (error: unknown) {
-      setNavigationError(getErrorMessage(error));
-    } finally {
-      setIsReOptimizing(false);
-    }
-  };
 
   const rerouteCurrentLeg = useCallback(async () => {
     if (!truckLocation || !currentStopCoords || isRerouting) return;
@@ -1244,6 +1109,62 @@ export default function NavPage() {
     t,
   ]);
 
+  const completeDayPlanStop = () => {
+    if (!dayPlanStopAddress) return;
+
+    const savedDayPlan = localStorage.getItem(DAY_PLAN_STORAGE_KEY);
+    if (!savedDayPlan) return;
+
+    try {
+      const parsed = JSON.parse(savedDayPlan) as DayPlanState;
+      const completedStopIndex = parsed.routeData.route_order.indexOf(dayPlanStopAddress);
+      const remainingStops =
+        completedStopIndex === -1
+          ? parsed.routeData.route_order
+          : parsed.routeData.route_order.filter((_, index) => index !== completedStopIndex);
+
+      if (remainingStops.length === 0) {
+        localStorage.removeItem(DAY_PLAN_STORAGE_KEY);
+        return;
+      }
+
+      localStorage.setItem(
+        DAY_PLAN_STORAGE_KEY,
+        JSON.stringify({
+          ...parsed,
+          routeData: {
+            ...parsed.routeData,
+            route_order: remainingStops,
+          },
+          activeStopAddress: null,
+          needsReoptimization: remainingStops.length > 1,
+        } satisfies DayPlanState)
+      );
+    } catch (error) {
+      console.error("Failed to update day plan:", error);
+    }
+  };
+
+  const finishDayPlanDrive = () => {
+    completeDayPlanStop();
+    localStorage.removeItem("crewRouteState");
+    router.push("/");
+  };
+
+  const exitCurrentDrive = () => {
+    localStorage.removeItem("crewRouteState");
+    router.push("/");
+  };
+
+  const completeCurrentDrive = () => {
+    if (dayPlanStopAddress) {
+      finishDayPlanDrive();
+      return;
+    }
+
+    exitCurrentDrive();
+  };
+
   return (
     <main className="relative h-[100dvh] w-full overflow-hidden bg-slate-100">
       <div ref={mapContainerRef} className="h-[100dvh] w-full" />
@@ -1251,13 +1172,6 @@ export default function NavPage() {
       <div className="pointer-events-none absolute inset-x-0 top-0 z-20 p-2 sm:p-3">
         <div className="pointer-events-auto mx-auto max-w-5xl rounded-2xl border border-white/60 bg-white/85 p-2.5 sm:p-3 shadow-lg backdrop-blur">
           <div className="flex items-center justify-between gap-2">
-            <button
-              onClick={() => router.push("/")}
-              className="rounded-2xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 shadow-sm transition hover:bg-slate-50"
-            >
-              {t.back}
-            </button>
-
             <div className="min-w-0 flex-1 text-center">
               <div className="truncate text-base font-semibold text-slate-900">
                 {currentStopAddress ?? t.returnToStart}
@@ -1271,6 +1185,11 @@ export default function NavPage() {
                   {routeStatusLabel}
                 </span>
               </div>
+              {etaLabel && (
+                <div className="mt-1 text-xs font-semibold text-blue-700">
+                  {etaLabel}
+                </div>
+              )}
             </div>
             <button
               onClick={() => {
@@ -1332,13 +1251,6 @@ export default function NavPage() {
                 </option>
               ))}
             </select>
-            <button
-              onClick={reOptimizeRemainingRoute}
-              disabled={isReOptimizing}
-              className="rounded-2xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-700"
-            >
-              {isReOptimizing ? t.optimizing : t.reOptimize}
-            </button>
           </div>
 
           <div className="mt-4">
@@ -1389,87 +1301,6 @@ export default function NavPage() {
               </div>
             )}
           </div>
-          {showAddStopMenu && (
-            <div className="mb-3 max-h-56 overflow-y-auto rounded-2xl border border-slate-200 bg-white p-2 shadow-inner">
-              <div className="mb-2 px-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
-                {t.addAStop}
-              </div>
-              <div className="mb-3 px-2">
-                <input
-                  type="text"
-                  value={addStopSearch}
-                  onChange={(e) => setAddStopSearch(e.target.value)}
-                  placeholder={t.searchNewAddress}
-                  className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm"
-                />
-
-                {isSearchingAddStopAddresses && (
-                  <p className="mt-2 text-xs text-slate-500">{t.searchingAddresses}</p>
-                )}
-
-                {!isSearchingAddStopAddresses &&
-                  addStopSearch.trim().length >= 3 &&
-                  addStopSuggestions.length === 0 && (
-                    <p className="mt-2 text-xs text-slate-500">{t.noAddressMatches}</p>
-                  )}
-              </div>
-              {addStopSuggestions.length > 0 && (
-                <div className="mb-3 space-y-2 px-2">
-                  {addStopSuggestions.map((suggestion) => (
-                    <button
-                      key={suggestion.address}
-                      type="button"
-                      disabled={isReOptimizing}
-                      onClick={async () => {
-                        setAvailableStops((prev) =>
-                          prev.some((stop) => stop.address === suggestion.address)
-                            ? prev
-                            : [...prev, suggestion]
-                        );
-
-                        await handleAddStopToRoute(suggestion);
-                      }}
-                      className={`block w-full rounded-xl border px-3 py-2 text-left text-sm transition ${
-                        addingStopAddress === suggestion.address
-                          ? "border-emerald-500 bg-emerald-100 text-emerald-900"
-                          : "border-slate-200 bg-white hover:bg-slate-100"
-                      }`}
-                    >
-                      <div className="font-semibold">
-                        {addingStopAddress === suggestion.address ? t.adding : t.customAddress}
-                      </div>
-                      <div className="text-xs text-slate-500">{suggestion.address}</div>
-                    </button>
-                  ))}
-                </div>
-              )}
-              <div className="space-y-2">
-                {availableStops
-                  .filter(
-                    (property) =>
-                      !routeData?.route_order?.includes(property.address) &&
-                      property.address !== addingStopAddress
-                  )
-                  .map((property) => (
-                    <button
-                      key={property.address}
-                      disabled={isReOptimizing}
-                      onClick={() => handleAddStopToRoute(property)}
-                      className={`block w-full rounded-xl border px-3 py-2 text-left text-sm transition ${
-                        addingStopAddress === property.address
-                          ? "border-emerald-500 bg-emerald-100 text-emerald-900"
-                          : "border-slate-200 bg-slate-50 text-slate-800 hover:bg-slate-100"
-                      }`}
-                    >
-                      <div className="font-semibold">
-                        {addingStopAddress === property.address ? t.adding : property.customerName}
-                      </div>
-                      <div className="text-xs text-slate-500">{property.address}</div>
-                    </button>
-                  ))}
-              </div>
-            </div>
-          )}
           {navigationError && (
             <div className="mb-3 flex items-start justify-between gap-3 rounded-xl border border-red-300 bg-red-50 px-3 py-2 text-sm font-semibold text-red-700">
               <span>{navigationError}</span>
@@ -1487,7 +1318,7 @@ export default function NavPage() {
               {arrivalSuggestionText}
             </div>
           )}
-          <div className="grid grid-cols-4 gap-2">
+          <div className="grid grid-cols-2 gap-2">
             <button
               onClick={() => {
                 if (
@@ -1501,13 +1332,7 @@ export default function NavPage() {
                   if (!confirmed) return;
                 }
 
-                const totalSegments = orsRoute?.routes?.[0]?.segments?.length ?? 0;
-                setLastRerouteAt(0);
-                setCurrentLegPath([]);
-                setCurrentLegIndex((prev) => {
-                  if (prev >= totalSegments - 1) return prev;
-                  return prev + 1;
-                });
+                completeCurrentDrive();
               }}
               disabled={!orsRoute?.routes?.[0]?.segments?.length}
               className={`rounded-2xl px-4 py-3 text-sm font-semibold text-white shadow-sm transition disabled:opacity-50 sm:text-base ${
@@ -1516,48 +1341,13 @@ export default function NavPage() {
                   : "bg-orange-600 hover:bg-orange-700"
               }`}
             >
-              {t.markArrived}
+              {t.completeRoute}
             </button>
             <button
-              onClick={() => {
-                const totalSegments = orsRoute?.routes?.[0]?.segments?.length ?? 0;
-                setLastRerouteAt(0);
-                setCurrentLegPath([]);
-                setCurrentLegProgressIndex(0);
-                setCurrentLegIndex((prev) => {
-                  if (prev >= totalSegments - 1) return prev;
-                  return prev + 1;
-                });
-              }}
-              className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-slate-50 sm:text-base"
-            >
-              {t.skipStop}
-            </button>
-            <button
-              onClick={() => {
-                setShowAddStopMenu((prev) => {
-                  const next = !prev;
-
-                  if (!next) {
-                    setAddStopSearch("");
-                    setAddStopSuggestions([]);
-                  }
-
-                  return next;
-                });
-              }}
-              className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-slate-50 sm:text-base"
-            >
-              {t.addStop}
-            </button>
-            <button
-              onClick={() => {
-                localStorage.removeItem("crewRouteState");
-                router.push("/");
-              }}
+              onClick={exitCurrentDrive}
               className="rounded-2xl border border-red-300 bg-white px-4 py-3 text-sm font-semibold text-red-600 shadow-sm transition hover:bg-red-50 sm:text-base"
             >
-              {navigationStarted ? t.endRoute : t.cancel}
+              {t.cancelDrive}
             </button>
           </div>
         </div>

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import maplibregl from "maplibre-gl";
 import { decodePolyline, getClosestPathIndex } from "@/lib/geo";
@@ -17,6 +17,7 @@ import { nurseryStop, properties, startCoordsMap } from "@/lib/stops";
 import type {
   AppRoute,
   Coordinate,
+  DayPlanState,
   RouteApiResponse,
   RouteData,
   RouteDecisionReport,
@@ -29,6 +30,8 @@ type SelectedStop = StopOption & {
 };
 
 type RouteMode = "single" | "full";
+
+const DAY_PLAN_STORAGE_KEY = "crewDayPlanState";
 
 export default function Home() {
   const router = useRouter();
@@ -52,6 +55,13 @@ export default function Home() {
   const [isSearchingAddresses, setIsSearchingAddresses] = useState(false);
   const [orsRoute, setOrsRoute] = useState<AppRoute | null>(null);
   const [routeData, setRouteData] = useState<RouteData | null>(null);
+  const [dayPlan, setDayPlan] = useState<RouteData | null>(null);
+  const [dayPlanNeedsReoptimization, setDayPlanNeedsReoptimization] = useState(false);
+  const [startingDayPlanAddress, setStartingDayPlanAddress] = useState<string | null>(null);
+  const [showAddDayPlanStopMenu, setShowAddDayPlanStopMenu] = useState(false);
+  const [dayPlanAddressSearch, setDayPlanAddressSearch] = useState("");
+  const [dayPlanAddressSuggestions, setDayPlanAddressSuggestions] = useState<StopOption[]>([]);
+  const [isSearchingDayPlanAddresses, setIsSearchingDayPlanAddresses] = useState(false);
   const [trafficAssessment, setTrafficAssessment] = useState<TrafficAssessment | null>(null);
   const [routeDecision, setRouteDecision] = useState<RouteDecisionReport | null>(null);
   const [showDecisionDetails, setShowDecisionDetails] = useState(false);
@@ -69,6 +79,15 @@ export default function Home() {
       ),
     [customStops]
   );
+  const availableDayPlanStops = useMemo(() => {
+    const scheduledAddresses = new Set(dayPlan?.route_order ?? []);
+
+    return [nurseryStop, ...properties, ...customStops].filter(
+      (stop, index, stops) =>
+        !scheduledAddresses.has(stop.address) &&
+        stops.findIndex((candidate) => candidate.address === stop.address) === index
+    );
+  }, [customStops, dayPlan]);
 
   const createSelectedStop = (stop: StopOption): SelectedStop => ({
     ...stop,
@@ -162,6 +181,60 @@ export default function Home() {
       clearTimeout(timeout);
     };
   }, [customAddressSearch]);
+
+  useEffect(() => {
+    const query = dayPlanAddressSearch.trim();
+
+    if (query.length < 3) {
+      setDayPlanAddressSuggestions([]);
+      setIsSearchingDayPlanAddresses(false);
+      return;
+    }
+
+    let isCancelled = false;
+
+    const timeout = setTimeout(async () => {
+      try {
+        setIsSearchingDayPlanAddresses(true);
+
+        const res = await fetch(
+          `/api/search-addresses?q=${encodeURIComponent(query)}`
+        );
+        const data = await res.json();
+
+        if (!res.ok) {
+          throw new Error(data.error || "Address search failed");
+        }
+
+        if (isCancelled) return;
+
+        const existingAddresses = new Set([
+          ...properties.map((property) => property.address.toLowerCase()),
+          ...customStops.map((stop) => stop.address.toLowerCase()),
+          ...(dayPlan?.route_order ?? []).map((address) => address.toLowerCase()),
+        ]);
+
+        setDayPlanAddressSuggestions(
+          (data.results || []).filter(
+            (item: StopOption) => !existingAddresses.has(item.address.toLowerCase())
+          )
+        );
+      } catch {
+        if (!isCancelled) {
+          setDayPlanAddressSuggestions([]);
+        }
+      } finally {
+        if (!isCancelled) {
+          setIsSearchingDayPlanAddresses(false);
+        }
+      }
+    }, 350);
+
+    return () => {
+      isCancelled = true;
+      clearTimeout(timeout);
+    };
+  }, [customStops, dayPlan, dayPlanAddressSearch]);
 
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) return;
@@ -486,6 +559,44 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    const savedState = localStorage.getItem(DAY_PLAN_STORAGE_KEY);
+    if (!savedState) return;
+
+    try {
+      const parsed = JSON.parse(savedState) as DayPlanState;
+
+      if (!parsed.routeData?.route_order?.length) return;
+
+      setStart(parsed.start);
+      setDayPlan(parsed.routeData);
+      setDayPlanNeedsReoptimization(Boolean(parsed.needsReoptimization));
+      setRouteMode("full");
+
+      if (Array.isArray(parsed.customStops)) {
+        setCustomStops(parsed.customStops);
+      }
+    } catch (error) {
+      console.error("Failed to restore day plan:", error);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!dayPlan?.route_order.length) {
+      localStorage.removeItem(DAY_PLAN_STORAGE_KEY);
+      return;
+    }
+
+    const dayPlanState: DayPlanState = {
+      start,
+      routeData: dayPlan,
+      customStops,
+      needsReoptimization: dayPlanNeedsReoptimization,
+    };
+
+    localStorage.setItem(DAY_PLAN_STORAGE_KEY, JSON.stringify(dayPlanState));
+  }, [customStops, dayPlan, dayPlanNeedsReoptimization, start]);
+
+  useEffect(() => {
     const navigationState = {
       start,
       routeData,
@@ -592,16 +703,27 @@ export default function Home() {
         throw new Error(data.error || "API request failed.");
       }
 
-      setRouteData({
+      const nextRouteData = {
         ...data.output,
         reason:
           routeMode === "single"
             ? t.singleStopReason
             : data.output.reason,
-      });
-      setOrsRoute(data.orsRoute);
-      setTrafficAssessment(data.trafficAssessment ?? null);
-      setRouteDecision(data.routeDecision ?? null);
+      };
+
+      if (routeMode === "full") {
+        setDayPlan(nextRouteData);
+        setDayPlanNeedsReoptimization(false);
+        setRouteData(null);
+        setOrsRoute(null);
+        setTrafficAssessment(null);
+        setRouteDecision(null);
+      } else {
+        setRouteData(nextRouteData);
+        setOrsRoute(data.orsRoute);
+        setTrafficAssessment(data.trafficAssessment ?? null);
+        setRouteDecision(data.routeDecision ?? null);
+      }
       setRouteNeedsRebuild(false);
       setSelectedStops([]);
       console.log("ROUTE DATA BEING SET:", data.output);
@@ -614,13 +736,86 @@ export default function Home() {
     }
   };
 
-  const rebuildRouteFromCurrentOrder = async () => {
-    if (!routeData?.route_order.length) return;
+  const startDayPlanDrive = async (address: string) => {
+    const coords = stopMap.get(address);
+
+    if (!currentLocation) {
+      setError(t.waitingForLocation);
+      return;
+    }
+
+    if (!coords) {
+      setError(t.missingStopCoordinates);
+      return;
+    }
+
+    try {
+      setStartingDayPlanAddress(address);
+      setError("");
+
+      const res = await fetch("/api/test-openai", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          date,
+          time,
+          start,
+          stops: [{ address, coords }],
+          preserveOrder: true,
+          originCoords: currentLocation,
+          returnToStart: false,
+          includeDecisionReport: showDecisionDetails,
+          language,
+        }),
+      });
+
+      const data = (await res.json()) as RouteApiResponse;
+
+      if (!res.ok || !data.output || !data.orsRoute) {
+        throw new Error(data.error || "Failed to create the next drive.");
+      }
+
+      const navigationState = {
+        start,
+        routeData: data.output,
+        orsRoute: data.orsRoute,
+        trafficAssessment: data.trafficAssessment ?? null,
+        routeDecision: data.routeDecision ?? null,
+        currentLegIndex: 0,
+        followTruck: true,
+        customStops,
+        routeMode: "single" as const,
+        dayPlanStopAddress: address,
+      };
+
+      const dayPlanState: DayPlanState = {
+        start,
+        routeData: dayPlan ?? { route_order: [address], reason: "" },
+        customStops,
+        activeStopAddress: address,
+        needsReoptimization: false,
+      };
+
+      localStorage.setItem("crewRouteState", JSON.stringify(navigationState));
+      localStorage.setItem(DAY_PLAN_STORAGE_KEY, JSON.stringify(dayPlanState));
+      router.push("/nav");
+    } catch (error: unknown) {
+      setError(getErrorMessage(error));
+    } finally {
+      setStartingDayPlanAddress(null);
+    }
+  };
+
+  const reOptimizeDayPlan = useCallback(async () => {
+    if (!dayPlan?.route_order.length) return;
 
     setRebuildingRoute(true);
+    setDayPlanNeedsReoptimization(false);
     setError("");
 
-    const orderedStops = routeData.route_order
+    const remainingStops = dayPlan.route_order
       .map((address) => {
         const coords = stopMap.get(address);
 
@@ -632,8 +827,8 @@ export default function Home() {
       })
       .filter(Boolean) as { address: string; coords: [number, number] }[];
 
-    if (orderedStops.length !== routeData.route_order.length) {
-      setError("Could not rebuild route because one or more stops are missing coordinates.");
+    if (remainingStops.length !== dayPlan.route_order.length) {
+      setError(t.missingStopCoordinates);
       setRebuildingRoute(false);
       return;
     }
@@ -648,8 +843,9 @@ export default function Home() {
           date,
           time,
           start,
-          stops: orderedStops,
-          preserveOrder: true,
+          stops: remainingStops,
+          originCoords: currentLocation ?? undefined,
+          returnToStart: true,
           includeDecisionReport: showDecisionDetails,
           language,
         }),
@@ -658,20 +854,23 @@ export default function Home() {
       const data = (await res.json()) as RouteApiResponse;
 
       if (!res.ok || !data.output || !data.orsRoute) {
-        throw new Error(data.error || "Failed to rebuild route.");
+        throw new Error(data.error || "Failed to re-optimize the day plan.");
       }
 
-      setRouteData(data.output);
-      setOrsRoute(data.orsRoute);
-      setTrafficAssessment(data.trafficAssessment ?? null);
-      setRouteDecision(data.routeDecision ?? null);
+      setDayPlan(data.output);
       setRouteNeedsRebuild(false);
     } catch (error: unknown) {
       setError(getErrorMessage(error));
     } finally {
       setRebuildingRoute(false);
     }
-  };
+  }, [currentLocation, date, dayPlan, language, showDecisionDetails, start, stopMap, t.missingStopCoordinates, time]);
+
+  useEffect(() => {
+    if (!dayPlanNeedsReoptimization || rebuildingRoute) return;
+
+    reOptimizeDayPlan();
+  }, [dayPlanNeedsReoptimization, reOptimizeDayPlan, rebuildingRoute]);
 
   function getErrorMessage(error: unknown): string {
     return error instanceof Error ? error.message : "Something went wrong...";
@@ -721,6 +920,29 @@ export default function Home() {
       property.address.toLowerCase().includes(search)
     );
   });
+  const displayedRouteData = routeMode === "full" ? dayPlan : routeData;
+
+  const addStopToDayPlan = (stop: StopOption) => {
+    setDayPlan((prev) => {
+      if (!prev || prev.route_order.includes(stop.address)) return prev;
+
+      return {
+        ...prev,
+        route_order: [...prev.route_order, stop.address],
+      };
+    });
+    setDayPlanNeedsReoptimization(true);
+    setShowAddDayPlanStopMenu(false);
+    setDayPlanAddressSearch("");
+    setDayPlanAddressSuggestions([]);
+  };
+
+  const addCustomStopToDayPlan = (stop: StopOption) => {
+    setCustomStops((prev) =>
+      prev.some((item) => item.address === stop.address) ? prev : [...prev, stop]
+    );
+    addStopToDayPlan(stop);
+  };
 
   const nurserySelectedCount = selectedStops.filter(
     (stop) => stop.address === nurseryStop.address
@@ -1115,13 +1337,15 @@ export default function Home() {
                       : t.optimizeRoute}
                 </button>
 
-                <button
-                  onClick={() => router.push("/nav")}
-                  disabled={!routeData || !orsRoute || routeNeedsRebuild}
-                  className="rounded-xl bg-blue-700 px-4 py-3 font-medium text-white transition hover:bg-blue-800 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {t.openNavigation}
-                </button>
+                {routeMode === "single" && (
+                  <button
+                    onClick={() => router.push("/nav")}
+                    disabled={!routeData || !orsRoute || routeNeedsRebuild}
+                    className="rounded-xl bg-blue-700 px-4 py-3 font-medium text-white transition hover:bg-blue-800 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {t.openNavigation}
+                  </button>
+                )}
               </div>
 
               {error && (
@@ -1130,33 +1354,112 @@ export default function Home() {
                 </p>
               )}
             </div>
-            {routeData && (
+            {displayedRouteData && (
               <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
                 <h2 className="mb-3 text-lg font-semibold text-slate-900">
                   {routeMode === "single" ? t.currentRoute : t.optimizedRoute}
                 </h2>
-                {routeMode === "full" && routeNeedsRebuild && (
-                  <div className = "mb-4 rounded-xl border border-amber-300 bg-amber-50 p-3">
-                  <p className="mb-4 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800">
-                    {t.routeOrderChanged}
-                  </p>
-                  <button
-                    type="button"
-                    onClick={rebuildRouteFromCurrentOrder}
-                    disabled={rebuildingRoute}
-                    className="mt-3 w-full rounded-xl bg-amber-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {rebuildingRoute ? t.rebuilding : t.rebuildRoute}
-                  </button>
-                </div>
+                {routeMode === "full" && (
+                  <>
+                    <div className="mb-4 grid grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setShowAddDayPlanStopMenu((prev) => !prev)}
+                        className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800"
+                      >
+                        {showAddDayPlanStopMenu ? t.closeAddStop : t.addStopToPlan}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={reOptimizeDayPlan}
+                        disabled={rebuildingRoute}
+                        className="rounded-xl border border-blue-300 bg-blue-50 px-4 py-2 text-sm font-semibold text-blue-700 transition hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {rebuildingRoute ? t.optimizing : t.reOptimizeRemaining}
+                      </button>
+                    </div>
+                    {showAddDayPlanStopMenu && (
+                      <div className="mb-4 max-h-64 overflow-y-auto rounded-xl border border-slate-200 bg-slate-50 p-2">
+                        <div className="mb-3 rounded-lg border border-slate-200 bg-white p-2">
+                          <input
+                            type="text"
+                            value={dayPlanAddressSearch}
+                            onChange={(event) => setDayPlanAddressSearch(event.target.value)}
+                            placeholder={t.searchNewAddress}
+                            className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                          />
+                          {isSearchingDayPlanAddresses && (
+                            <p className="mt-2 text-xs text-slate-500">
+                              {t.searchingAddresses}
+                            </p>
+                          )}
+                          {!isSearchingDayPlanAddresses &&
+                            dayPlanAddressSearch.trim().length >= 3 &&
+                            dayPlanAddressSuggestions.length === 0 && (
+                              <p className="mt-2 text-xs text-slate-500">
+                                {t.noAddressMatches}
+                              </p>
+                            )}
+                          {dayPlanAddressSuggestions.length > 0 && (
+                            <div className="mt-2 space-y-2">
+                              {dayPlanAddressSuggestions.map((stop) => (
+                                <button
+                                  key={stop.address}
+                                  type="button"
+                                  onClick={() => addCustomStopToDayPlan(stop)}
+                                  disabled={rebuildingRoute}
+                                  className="block w-full rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-left transition hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-50"
+                                >
+                                  <div className="text-sm font-semibold text-slate-900">
+                                    {stop.customerName}
+                                  </div>
+                                  <div className="mt-0.5 text-xs text-slate-500">
+                                    {stop.address}
+                                  </div>
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                        {availableDayPlanStops.length === 0 ? (
+                          <p className="px-2 py-3 text-sm text-slate-500">
+                            {t.noStopsAvailable}
+                          </p>
+                        ) : (
+                          <div className="space-y-2">
+                            {availableDayPlanStops.map((stop) => (
+                              <button
+                                key={stop.address}
+                                type="button"
+                                onClick={() => addStopToDayPlan(stop)}
+                                disabled={rebuildingRoute}
+                                className="block w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-left transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                <div className="text-sm font-semibold text-slate-900">
+                                  {stop.customerName}
+                                </div>
+                                <div className="mt-0.5 text-xs text-slate-500">
+                                  {stop.address}
+                                </div>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </>
                 )}
                 <div className="space-y-2">
-                  {routeData.route_order.map((stop: string, index: number) => {
+                  {displayedRouteData.route_order.map((stop: string, index: number) => {
                     const isNursery = stop === nurseryStop.address;
                     return (
                       <div
                         key={`${stop}-${index}`}
-                        className="rounded-xl border border-slate-200 bg-slate-50 p-3"
+                        className={`rounded-xl border p-3 ${
+                          routeMode === "full" && index === 0
+                            ? "border-blue-300 bg-blue-50"
+                            : "border-slate-200 bg-slate-50"
+                        }`}
                       >
                         <div className="flex items-start gap-3">
                           <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-slate-900 text-xs font-bold text-white">
@@ -1164,6 +1467,11 @@ export default function Home() {
                           </div>
 
                           <div className="min-w-0 flex-1">
+                            {routeMode === "full" && index === 0 && (
+                              <div className="mb-1 text-[11px] font-bold uppercase tracking-wide text-blue-700">
+                                {t.nextStop}
+                              </div>
+                            )}
                             <div
                               className={`text-sm font-semibold ${
                                 isNursery ? "text-emerald-700" : "text-slate-900"
@@ -1175,6 +1483,16 @@ export default function Home() {
                               {stop}
                             </div>
                           </div>
+                          {routeMode === "full" && (
+                            <button
+                              type="button"
+                              onClick={() => startDayPlanDrive(stop)}
+                              disabled={startingDayPlanAddress !== null}
+                              className="shrink-0 rounded-lg bg-blue-700 px-3 py-2 text-xs font-semibold text-white transition hover:bg-blue-800 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              {startingDayPlanAddress === stop ? t.startingDrive : t.startDrive}
+                            </button>
+                          )}
                         </div>
                         {routeMode === "full" && (
                           <div className="mt-3 grid grid-cols-3 gap-2">
@@ -1182,7 +1500,7 @@ export default function Home() {
                             type="button"
                             disabled={index === 0}
                             onClick={() => {
-                              setRouteData((prev) => {
+                              setDayPlan((prev) => {
                                 if (!prev || index === 0) return prev;
 
                                 const nextOrder = [...prev.route_order];
@@ -1197,7 +1515,7 @@ export default function Home() {
                                 };
                               });
 
-                              setRouteNeedsRebuild(true);
+                              setDayPlanNeedsReoptimization(false);
                             }}
                             className="rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-xs font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
                           >
@@ -1205,9 +1523,9 @@ export default function Home() {
                           </button>
                           <button
                             type="button"
-                            disabled={index === routeData.route_order.length - 1}
+                            disabled={index === displayedRouteData.route_order.length - 1}
                             onClick={() => {
-                              setRouteData((prev) => {
+                              setDayPlan((prev) => {
                                 if (!prev || index === prev.route_order.length - 1) return prev;
 
                                 const nextOrder = [...prev.route_order];
@@ -1222,7 +1540,7 @@ export default function Home() {
                                 };
                               });
 
-                              setRouteNeedsRebuild(true);
+                              setDayPlanNeedsReoptimization(false);
                             }}
                             className="rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-xs font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
                           >
@@ -1231,7 +1549,7 @@ export default function Home() {
                           <button
                             type="button"
                             onClick={() => {
-                              setRouteData((prev) => {
+                              setDayPlan((prev) => {
                                 if (!prev) return prev;
 
                                 return {
@@ -1242,7 +1560,7 @@ export default function Home() {
                                 };
                               });
 
-                              setRouteNeedsRebuild(true);
+                              setDayPlanNeedsReoptimization(false);
                             }}
                             className="rounded-lg border border-red-300 bg-white px-2 py-1.5 text-xs font-semibold text-red-600 hover:bg-red-50"
                           >
@@ -1256,7 +1574,7 @@ export default function Home() {
                 </div>
                 <div className="mt-4 rounded-xl bg-slate-50 p-4">
                   <p className="text-sm text-slate-700">
-                    <strong>{t.reason}:</strong> {routeData.reason}
+                    <strong>{t.reason}:</strong> {displayedRouteData.reason}
                   </p>
                 </div>
                 {trafficAssessment && (
