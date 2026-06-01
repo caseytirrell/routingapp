@@ -2,25 +2,23 @@ import OpenAI from "openai";
 import { NextResponse } from "next/server";
 import { decodePolyline } from "@/lib/geo";
 import { normalizeLanguage, type AppLanguage } from "@/lib/i18n";
+import {
+  chooseRouteCandidate as chooseValidatedRouteCandidate,
+  createRouteCandidates as createValidatedRouteCandidates,
+} from "@/lib/routing-policy";
 import type {
   AppRoute,
-  CommercialRestrictionValidation,
   Coordinate,
   Route,
   RouteDecisionCandidate,
   RouteDecisionReport,
-  RouteStep,
   RouteStopInput,
   TrafficAssessment,
 } from "@/lib/route-types";
 import { NURSERY_ADDRESS, normalizeAddress, startCoordsMap } from "@/lib/stops";
 
 const USE_GEOAPIFY_ROUTING = false;
-const TOMTOM_TRAFFIC_THRESHOLD_RATIO = 0.25;
-const TOMTOM_MAX_SUPPORTING_POINTS = 50;
 const GOOGLE_CANDIDATE_LIMIT = 2;
-const GARDEN_STATE_PARKWAY_EXIT_105_LATITUDE = 40.283611;
-const GARDEN_STATE_PARKWAY_EXIT_105_BUFFER_DEGREES = 0.002;
 const ORS_SMALL_TRUCK_OPTIONS = {
   vehicle_type: "delivery",
   profile_params: {
@@ -33,33 +31,6 @@ const ORS_SMALL_TRUCK_OPTIONS = {
     },
   },
 };
-
-const COMMERCIAL_RESTRICTION_RULES = [
-  {
-    id: "garden-state-parkway",
-    label: "Garden State Parkway",
-    patterns: [
-      /\bgarden state parkway\b/i,
-      /\bgarden state pkwy\b/i,
-      /\bgsp\b/i,
-    ],
-    type: "allowed-south-of-latitude",
-    maxLatitude: GARDEN_STATE_PARKWAY_EXIT_105_LATITUDE,
-    reason: "Garden State Parkway is allowed only south of Interchange 105 for the commercial restriction rule.",
-  },
-  {
-    id: "palisades-interstate-parkway",
-    label: "Palisades Interstate Parkway",
-    patterns: [
-      /\bpalisades interstate parkway\b/i,
-      /\bpalisades interstate pkwy\b/i,
-      /\bpalisades parkway\b/i,
-      /\bpalisades pkwy\b/i,
-    ],
-    type: "always-restricted",
-    reason: "Commercial traffic is prohibited on the Palisades Interstate Parkway.",
-  },
-];
 
 function getOpenAIClient() {
   const apiKey = process.env.OPENAI_API_KEY;
@@ -104,26 +75,6 @@ type GeoapifyRouteResponse = {
 type OptimizedRouteOutput = {
   route_order: string[];
   reason: string;
-};
-
-type TomTomRouteSummary = {
-  lengthInMeters?: number;
-  travelTimeInSeconds?: number;
-  trafficDelayInSeconds?: number;
-  trafficLengthInMeters?: number;
-  noTrafficTravelTimeInSeconds?: number;
-  historicTrafficTravelTimeInSeconds?: number;
-  liveTrafficIncidentsTravelTimeInSeconds?: number;
-};
-
-type TomTomRouteResponse = {
-  routes?: {
-    summary?: TomTomRouteSummary;
-  }[];
-  detailedError?: {
-    message?: string;
-  };
-  error?: string;
 };
 
 type GoogleRouteStep = {
@@ -191,11 +142,6 @@ function jsonError(message: string, status: number) {
   return NextResponse.json({ success: false, error: message }, { status });
 }
 
-function getRouteGeometry(route: Route): Coordinate[] {
-  if (Array.isArray(route.geometry)) return route.geometry;
-  return decodePolyline(route.geometry);
-}
-
 function parseDurationSeconds(value: string | undefined): number | null {
   if (!value) return null;
 
@@ -204,459 +150,6 @@ function parseDurationSeconds(value: string | undefined): number | null {
   if (!match) return null;
 
   return Math.round(Number(match[1]));
-}
-
-function getRouteDistanceMeters(route: Route): number | null {
-  return route.distance ?? route.summary?.distance ?? null;
-}
-
-function getRouteDurationSeconds(route: Route): number | null {
-  return route.duration ?? route.time ?? route.summary?.duration ?? null;
-}
-
-function getRouteInstructionText(route: Route): string {
-  return (route.segments ?? [])
-    .flatMap((segment) => segment.steps ?? [])
-    .map((step) => {
-      const instruction =
-        typeof step.instruction === "string"
-          ? step.instruction
-          : step.instruction?.text;
-
-      return [instruction, step.name].filter(Boolean).join(" ");
-    })
-    .join(" ");
-}
-
-function getStepText(step: RouteStep): string {
-  const instruction =
-    typeof step.instruction === "string"
-      ? step.instruction
-      : step.instruction?.text;
-
-  return [instruction, step.name].filter(Boolean).join(" ");
-}
-
-function getMatchedStepCoordinates(route: Route, patterns: RegExp[]) {
-  const geometry = getRouteGeometry(route);
-  const matchedCoordinates: Coordinate[] = [];
-
-  for (const segment of route.segments ?? []) {
-    for (const step of segment.steps ?? []) {
-      const stepText = getStepText(step);
-
-      if (!patterns.some((pattern) => pattern.test(stepText))) continue;
-
-      const startIndex = step.way_points?.[0];
-      const endIndex = step.way_points?.[1];
-
-      if (typeof startIndex !== "number" || typeof endIndex !== "number") {
-        continue;
-      }
-
-      matchedCoordinates.push(
-        ...geometry.slice(
-          Math.max(0, startIndex),
-          Math.min(geometry.length, endIndex + 1)
-        )
-      );
-    }
-  }
-
-  return matchedCoordinates;
-}
-
-function validateCommercialRestrictions(route: Route): CommercialRestrictionValidation {
-  const instructionText = getRouteInstructionText(route);
-
-  if (!instructionText.trim()) {
-    return {
-      status: "unknown",
-      reason:
-        "Commercial validation could not inspect road names because this route did not include turn-by-turn road instructions.",
-      matchedRules: [],
-    };
-  }
-
-  const matchedRules = [];
-
-  for (const rule of COMMERCIAL_RESTRICTION_RULES) {
-    if (!rule.patterns.some((pattern) => pattern.test(instructionText))) {
-      continue;
-    }
-
-    if (rule.type === "allowed-south-of-latitude") {
-      if (typeof rule.maxLatitude !== "number") continue;
-
-      const coordinates = getMatchedStepCoordinates(route, rule.patterns);
-
-      if (coordinates.length === 0) {
-        matchedRules.push({
-          label: rule.label,
-          reason: `${rule.reason} The app could not confirm which section was used, so it rejected this candidate.`,
-        });
-        continue;
-      }
-
-      const maxLatitude = Math.max(...coordinates.map((coordinate) => coordinate[1]));
-      const cutoffLatitude =
-        rule.maxLatitude + GARDEN_STATE_PARKWAY_EXIT_105_BUFFER_DEGREES;
-
-      if (maxLatitude > cutoffLatitude) {
-        matchedRules.push({
-          label: rule.label,
-          reason: `${rule.reason} This route appears to use it north of Interchange 105.`,
-        });
-      }
-
-      continue;
-    }
-
-    matchedRules.push({
-      label: rule.label,
-      reason: rule.reason,
-    });
-  }
-
-  if (matchedRules.length > 0) {
-    return {
-      status: "rejected",
-      reason: matchedRules.map((rule) => rule.reason).join(" "),
-      matchedRules: matchedRules.map((rule) => rule.label),
-    };
-  }
-
-  return {
-    status: "passed",
-    reason: "No known commercial-restricted roads were found in the route instructions.",
-    matchedRules: [],
-  };
-}
-
-function sampleRouteGeometry(geometry: Coordinate[]) {
-  if (geometry.length <= TOMTOM_MAX_SUPPORTING_POINTS) return geometry;
-
-  const sampled: Coordinate[] = [];
-  const lastIndex = geometry.length - 1;
-
-  for (let i = 0; i < TOMTOM_MAX_SUPPORTING_POINTS; i++) {
-    const index = Math.round((i / (TOMTOM_MAX_SUPPORTING_POINTS - 1)) * lastIndex);
-    sampled.push(geometry[index]);
-  }
-
-  return sampled;
-}
-
-function createUnavailableTrafficAssessment(
-  reason: string,
-  routeAttempt: number
-): TrafficAssessment {
-  return {
-    status: "unavailable",
-    provider: "tomtom",
-    reason,
-    delaySeconds: null,
-    travelTimeSeconds: null,
-    noTrafficTravelTimeSeconds: null,
-    liveTrafficTravelTimeSeconds: null,
-    trafficDelaySeconds: null,
-    delayRatio: null,
-    trafficLengthMeters: null,
-    thresholdRatio: TOMTOM_TRAFFIC_THRESHOLD_RATIO,
-    routeAttempt,
-  };
-}
-
-function scoreTomTomSummary(
-  summary: TomTomRouteSummary,
-  routeAttempt: number
-): TrafficAssessment {
-  const travelTimeSeconds = summary.travelTimeInSeconds ?? null;
-  const liveTrafficTravelTimeSeconds =
-    summary.liveTrafficIncidentsTravelTimeInSeconds ?? null;
-  const noTrafficTravelTimeSeconds =
-    summary.noTrafficTravelTimeInSeconds ??
-    (travelTimeSeconds !== null && summary.trafficDelayInSeconds !== undefined
-      ? Math.max(travelTimeSeconds - summary.trafficDelayInSeconds, 0)
-      : null);
-  const trafficDelaySeconds = summary.trafficDelayInSeconds ?? null;
-  const liveDelaySeconds =
-    liveTrafficTravelTimeSeconds !== null && noTrafficTravelTimeSeconds !== null
-      ? Math.max(liveTrafficTravelTimeSeconds - noTrafficTravelTimeSeconds, 0)
-      : null;
-  const travelDelaySeconds =
-    travelTimeSeconds !== null && noTrafficTravelTimeSeconds !== null
-      ? Math.max(travelTimeSeconds - noTrafficTravelTimeSeconds, 0)
-      : null;
-  const delaySeconds = Math.max(
-    trafficDelaySeconds ?? 0,
-    liveDelaySeconds ?? 0,
-    travelDelaySeconds ?? 0
-  );
-  const delayRatio =
-    noTrafficTravelTimeSeconds && noTrafficTravelTimeSeconds > 0
-      ? delaySeconds / noTrafficTravelTimeSeconds
-      : null;
-  const accepted =
-    delayRatio === null || delayRatio <= TOMTOM_TRAFFIC_THRESHOLD_RATIO;
-  const delayMinutes = Math.round(delaySeconds / 60);
-  const ratioPercent = delayRatio === null ? null : Math.round(delayRatio * 100);
-
-  return {
-    status: accepted ? "accepted" : "rejected",
-    provider: "tomtom",
-    reason:
-      ratioPercent === null
-        ? `TomTom traffic check completed with about ${delayMinutes} min delay.`
-        : `TomTom traffic check found about ${delayMinutes} min delay (${ratioPercent}% over no-traffic travel time).`,
-    delaySeconds,
-    travelTimeSeconds,
-    noTrafficTravelTimeSeconds,
-    liveTrafficTravelTimeSeconds,
-    trafficDelaySeconds,
-    delayRatio,
-    trafficLengthMeters: summary.trafficLengthInMeters ?? null,
-    thresholdRatio: TOMTOM_TRAFFIC_THRESHOLD_RATIO,
-    routeAttempt,
-  };
-}
-
-function createCommercialRejectedTrafficAssessment(
-  reason: string,
-  routeAttempt: number
-): TrafficAssessment {
-  return {
-    status: "rejected",
-    provider: "tomtom",
-    reason,
-    delaySeconds: null,
-    travelTimeSeconds: null,
-    noTrafficTravelTimeSeconds: null,
-    liveTrafficTravelTimeSeconds: null,
-    trafficDelaySeconds: null,
-    delayRatio: null,
-    trafficLengthMeters: null,
-    thresholdRatio: TOMTOM_TRAFFIC_THRESHOLD_RATIO,
-    routeAttempt,
-  };
-}
-
-async function assessRouteWithTomTom(
-  route: Route,
-  routeAttempt: number
-): Promise<TrafficAssessment> {
-  const apiKey = process.env.TOMTOM_API_KEY;
-
-  if (!apiKey) {
-    return createUnavailableTrafficAssessment("Missing TOMTOM_API_KEY.", routeAttempt);
-  }
-
-  const geometry = sampleRouteGeometry(getRouteGeometry(route));
-
-  if (geometry.length < 2) {
-    return createUnavailableTrafficAssessment("Route geometry is too short for TomTom traffic checking.", routeAttempt);
-  }
-
-  const origin = geometry[0];
-  const destination = geometry[geometry.length - 1];
-  const locations = `${origin[1]},${origin[0]}:${destination[1]},${destination[0]}`;
-  const url =
-    `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
-    `?key=${encodeURIComponent(apiKey)}` +
-    `&traffic=true` +
-    `&travelMode=truck` +
-    `&routeRepresentation=summaryOnly` +
-    `&computeTravelTimeFor=all` +
-    `&sectionType=traffic`;
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      supportingPoints: geometry.map(([longitude, latitude]) => ({
-        latitude,
-        longitude,
-      })),
-    }),
-    cache: "no-store",
-  });
-
-  const data = (await response.json()) as TomTomRouteResponse;
-
-  if (!response.ok) {
-    const message =
-      data.detailedError?.message ||
-      data.error ||
-      `TomTom traffic check failed with status ${response.status}.`;
-    return createUnavailableTrafficAssessment(message, routeAttempt);
-  }
-
-  const summary = data.routes?.[0]?.summary;
-
-  if (!summary) {
-    return createUnavailableTrafficAssessment("TomTom did not return a route summary.", routeAttempt);
-  }
-
-  return scoreTomTomSummary(summary, routeAttempt);
-}
-
-function compareCandidatesByRouteEta(
-  a: { route: Route; assessment?: TrafficAssessment },
-  b: { route: Route; assessment?: TrafficAssessment }
-) {
-  const aRouteTime = getRouteDurationSeconds(a.route) ?? Infinity;
-  const bRouteTime = getRouteDurationSeconds(b.route) ?? Infinity;
-  const aDisplayedRouteMinutes = Math.round(aRouteTime / 60);
-  const bDisplayedRouteMinutes = Math.round(bRouteTime / 60);
-
-  if (aDisplayedRouteMinutes !== bDisplayedRouteMinutes) {
-    return aDisplayedRouteMinutes - bDisplayedRouteMinutes;
-  }
-
-  const aTomTomTime = a.assessment?.travelTimeSeconds ?? Infinity;
-  const bTomTomTime = b.assessment?.travelTimeSeconds ?? Infinity;
-  const tomTomEtaDelta = aTomTomTime - bTomTomTime;
-
-  if (tomTomEtaDelta !== 0) return tomTomEtaDelta;
-
-  const routeEtaDelta = aRouteTime - bRouteTime;
-
-  if (routeEtaDelta !== 0) return routeEtaDelta;
-
-  return (
-    (a.assessment?.delayRatio ?? Infinity) -
-    (b.assessment?.delayRatio ?? Infinity)
-  );
-}
-
-async function chooseRouteCandidate(
-  candidates: RouteCandidateInput[],
-  options: {
-    scoreAllCandidates: boolean;
-  }
-): Promise<{
-  routeData: AppRoute;
-  trafficAssessment: TrafficAssessment;
-  routeDecision: RouteDecisionReport;
-}> {
-  if (candidates.length === 0) {
-    const trafficAssessment = createUnavailableTrafficAssessment("No routes were available to score.", 1);
-
-    return {
-      routeData: { routes: [] },
-      trafficAssessment,
-      routeDecision: {
-        selectedCandidateId: null,
-        selectedReason: "No route candidates were available.",
-        candidateCount: 0,
-        scoredCandidateCount: 0,
-        candidates: [],
-      },
-    };
-  }
-
-  const orderedCandidates = [...candidates].sort((a, b) =>
-    compareCandidatesByRouteEta(a, b)
-  );
-  const scoredRoutes: {
-    route: Route;
-    assessment: TrafficAssessment;
-    candidate: RouteDecisionCandidate;
-    input: RouteCandidateInput;
-  }[] = [];
-
-  for (let index = 0; index < orderedCandidates.length; index++) {
-    const input = orderedCandidates[index];
-    const commercialValidation = validateCommercialRestrictions(input.route);
-    const commercialAccepted = commercialValidation.status !== "rejected";
-    const assessment = commercialAccepted
-      ? await assessRouteWithTomTom(input.route, index + 1)
-      : createCommercialRejectedTrafficAssessment(
-          commercialValidation.reason,
-          index + 1
-        );
-    const routeDurationSeconds = getRouteDurationSeconds(input.route);
-    const tomTomTravelTimeSeconds = assessment.travelTimeSeconds;
-    const trafficAccepted = assessment.status === "accepted";
-    const accepted = trafficAccepted && commercialAccepted;
-    const providerAttempt =
-      orderedCandidates
-        .slice(0, index + 1)
-        .filter((candidate) => candidate.provider === input.provider).length;
-    const candidate: RouteDecisionCandidate = {
-      id: `${input.provider}-${providerAttempt}`,
-      provider: input.provider,
-      label: input.label,
-      selected: false,
-      accepted,
-      rejectionReason: accepted
-        ? null
-        : [
-            commercialValidation.status === "rejected"
-              ? commercialValidation.reason
-              : null,
-            assessment.status !== "accepted" ? assessment.reason : null,
-          ]
-            .filter(Boolean)
-            .join(" "),
-      distanceMeters: getRouteDistanceMeters(input.route),
-      routeDurationSeconds,
-      tomTomTravelTimeSeconds,
-      tomTomDelaySeconds: assessment.delaySeconds,
-      tomTomDelayRatio: assessment.delayRatio,
-      commercialValidation,
-      trafficAssessment: assessment,
-    };
-
-    scoredRoutes.push({ route: input.route, assessment, candidate, input });
-
-    if (accepted && !options.scoreAllCandidates) {
-      candidate.selected = true;
-      return {
-        routeData: {
-          routes: [input.route],
-        },
-        trafficAssessment: assessment,
-        routeDecision: {
-          selectedCandidateId: candidate.id,
-          selectedReason:
-            "Selected the fastest route ETA candidate that passed commercial validation and the TomTom traffic threshold.",
-          candidateCount: candidates.length,
-          scoredCandidateCount: scoredRoutes.length,
-          candidates: scoredRoutes.map((item) => item.candidate),
-        },
-      };
-    }
-  }
-
-  const acceptedRoutes = scoredRoutes.filter(
-    ({ candidate }) => candidate.accepted
-  );
-  const comparableRoutes = acceptedRoutes.length > 0 ? acceptedRoutes : scoredRoutes;
-  const bestRoute = [...comparableRoutes].sort(compareCandidatesByRouteEta)[0];
-
-  bestRoute.candidate.selected = true;
-
-  const selectedReason =
-    acceptedRoutes.length > 0
-      ? "Selected the commercial-valid route with the lowest displayed route ETA, using TomTom only when route ETA is tied."
-      : "No route passed both commercial validation and the traffic threshold, so the least-bad scored route was selected.";
-
-  return {
-    routeData: {
-      routes: [bestRoute.route],
-    },
-    trafficAssessment: bestRoute.assessment,
-    routeDecision: {
-      selectedCandidateId: bestRoute.candidate.id,
-      selectedReason,
-      candidateCount: candidates.length,
-      scoredCandidateCount: scoredRoutes.length,
-      candidates: scoredRoutes.map((item) => item.candidate),
-    },
-  };
 }
 
 function isCoordinate(value: unknown): value is Coordinate {
@@ -971,18 +464,6 @@ async function getGoogleRoute(coordinates: Coordinate[], language: AppLanguage) 
   return data;
 }
 
-function createRouteCandidates(
-  routeData: AppRoute,
-  provider: RouteDecisionCandidate["provider"],
-  limit: number
-): RouteCandidateInput[] {
-  return (routeData.routes ?? []).slice(0, limit).map((route, index) => ({
-    route,
-    provider,
-    label: `${provider.toUpperCase()} route ${index + 1}`,
-  }));
-}
-
 async function getOrsRoute(coordinates: Coordinate[], language: AppLanguage) {
   const response = await fetch(
     "https://api.heigit.org/openrouteservice/v2/directions/driving-hgv",
@@ -1287,7 +768,7 @@ export async function POST(request: Request) {
 
       const geoapifyData = await getGeoapifyRoute(orsCoordinates);
       routeData = convertGeoapifyToAppRoute(geoapifyData);
-      const selectedRoute = await chooseRouteCandidate(createRouteCandidates(routeData, "geoapify", 1), {
+      const selectedRoute = await chooseValidatedRouteCandidate(createValidatedRouteCandidates(routeData, "geoapify", 1), {
         scoreAllCandidates: shouldScoreAllCandidates,
       });
       routeData = selectedRoute.routeData;
@@ -1312,14 +793,14 @@ export async function POST(request: Request) {
 
       if (googleRouteData) {
         candidates.push(
-          ...createRouteCandidates(googleRouteData, "google", GOOGLE_CANDIDATE_LIMIT)
+          ...createValidatedRouteCandidates(googleRouteData, "google", GOOGLE_CANDIDATE_LIMIT)
         );
       } else if (isPointToPointRoute && googleResult.status === "rejected") {
         console.log("Google routing failed:", getErrorMessage(googleResult.reason));
       }
 
       if (orsRouteData) {
-        candidates.push(...createRouteCandidates(orsRouteData, "ors", 1));
+        candidates.push(...createValidatedRouteCandidates(orsRouteData, "ors", 1));
       } else if (orsResult.status === "rejected") {
         console.log("ORS routing failed:", getErrorMessage(orsResult.reason));
       }
@@ -1352,7 +833,7 @@ export async function POST(request: Request) {
         });
 
         const convertedRouteData = convertGeoapifyToAppRoute(geoapifyData);
-        const selectedRoute = await chooseRouteCandidate(createRouteCandidates(convertedRouteData, "geoapify", 1), {
+        const selectedRoute = await chooseValidatedRouteCandidate(createValidatedRouteCandidates(convertedRouteData, "geoapify", 1), {
           scoreAllCandidates: shouldScoreAllCandidates,
         });
         routeData = selectedRoute.routeData;
@@ -1378,7 +859,7 @@ export async function POST(request: Request) {
           convertedRouteData.routes[0]?.segments?.[0]?.steps?.[0] || "no-step"
         );
       } else {
-        const selectedRoute = await chooseRouteCandidate(candidates, {
+        const selectedRoute = await chooseValidatedRouteCandidate(candidates, {
           scoreAllCandidates: shouldScoreAllCandidates,
         });
         routeData = selectedRoute.routeData;

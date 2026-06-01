@@ -72,7 +72,7 @@ export default function Home() {
   const stopMap = useMemo(
     () =>
       new Map(
-        [...properties, ...customStops].map((stop) => [
+        [nurseryStop, ...properties, ...customStops].map((stop) => [
           stop.address,
           stop.coords as [number, number],
         ])

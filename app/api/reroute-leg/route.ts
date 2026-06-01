@@ -1,6 +1,11 @@
 import { NextResponse } from "next/server";
 import { normalizeLanguage } from "@/lib/i18n";
-import type { Coordinate } from "@/lib/route-types";
+import {
+  chooseRouteCandidate,
+  createRouteCandidates,
+  type RouteCandidateInput,
+} from "@/lib/routing-policy";
+import type { AppRoute, Coordinate } from "@/lib/route-types";
 
 const ORS_SMALL_TRUCK_OPTIONS = {
   vehicle_type: "delivery",
@@ -43,24 +48,6 @@ type GeoapifyRouteResponse = {
     };
   }[];
   error?: string;
-};
-
-type AppRoute = {
-  routes: {
-    geometry: Coordinate[];
-    segments: {
-      distance: number;
-      duration: number;
-      steps: {
-        name: string;
-        distance: number;
-        duration: number;
-        way_points: [number, number];
-      }[];
-    }[];
-    distance?: number;
-    time?: number;
-  }[];
 };
 
 function getErrorMessage(error: unknown): string {
@@ -214,54 +201,86 @@ export async function POST(request: Request) {
       return jsonError("Missing routing API keys.", 500);
     }
 
-    const orsResponse = await fetch(
-      "https://api.heigit.org/openrouteservice/v2/directions/driving-hgv",
-      {
-        method: "POST",
-        headers: {
-          Authorization: process.env.OPENROUTESERVICE_API_KEY || "",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          coordinates: [truckLocation, destination],
-          language,
-          options: ORS_SMALL_TRUCK_OPTIONS,
-          ...(typeof heading === "number"
-            ? {
-                bearings: [[Math.round(heading), 45]],
-                continue_straight: true,
-              }
-            : {}),
-        }),
+    const candidates: RouteCandidateInput[] = [];
+
+    if (process.env.OPENROUTESERVICE_API_KEY) {
+      try {
+        const response = await fetch(
+          "https://api.heigit.org/openrouteservice/v2/directions/driving-hgv",
+          {
+            method: "POST",
+            headers: {
+              Authorization: process.env.OPENROUTESERVICE_API_KEY,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              coordinates: [truckLocation, destination],
+              language,
+              options: ORS_SMALL_TRUCK_OPTIONS,
+              ...(typeof heading === "number"
+                ? {
+                    bearings: [[Math.round(heading), 45]],
+                    continue_straight: true,
+                  }
+                : {}),
+            }),
+            cache: "no-store",
+          }
+        );
+        const data = (await response.json()) as AppRoute;
+
+        if (!response.ok) {
+          throw new Error(`OpenRouteService reroute failed with status ${response.status}`);
+        }
+
+        const orsCandidates = createRouteCandidates(data, "ors", 1);
+        candidates.push(...orsCandidates);
+
+        const orsSelection = await chooseRouteCandidate(orsCandidates, {
+          scoreAllCandidates: true,
+        });
+
+        if (orsSelection.trafficAssessment.status === "accepted") {
+          return NextResponse.json({
+            success: true,
+            orsRoute: orsSelection.routeData,
+            trafficAssessment: orsSelection.trafficAssessment,
+            routeDecision: orsSelection.routeDecision,
+          });
+        }
+      } catch (error: unknown) {
+        console.log("ORS reroute did not produce an acceptable primary route:", getErrorMessage(error));
       }
-    );
-
-    console.log("REROUTE STATUS:", orsResponse.status);
-
-    let orsData: unknown = null;
-
-    try {
-      orsData = await orsResponse.json();
-      console.log("REROUTE DATA:", orsData);
-    } catch {
-      console.log("REROUTE response was not valid JSON");
+    } else {
+      console.log("ORS reroute skipped: Missing OPENROUTESERVICE_API_KEY.");
     }
 
-    if (!orsResponse.ok) {
-      console.log("ORS reroute failed, falling back to Geoapify...");
-
-      const geoapifyData = await getGeoapifyRoute([truckLocation, destination]);
-      console.log("GEOAPIFY REROUTE DATA:", geoapifyData);
-
-      return NextResponse.json({
-        success: true,
-        orsRoute: convertGeoapifyToAppRoute(geoapifyData),
-      });
+    if (process.env.GEOAPIFY_API_KEY) {
+      try {
+        const geoapifyData = await getGeoapifyRoute([truckLocation, destination]);
+        candidates.push(
+          ...createRouteCandidates(convertGeoapifyToAppRoute(geoapifyData), "geoapify", 1)
+        );
+      } catch (error: unknown) {
+        console.log("Geoapify reroute fallback failed:", getErrorMessage(error));
+      }
+    } else {
+      console.log("Geoapify reroute fallback skipped: Missing GEOAPIFY_API_KEY.");
     }
+
+    if (candidates.length === 0) {
+      throw new Error("No live reroute candidates were available.");
+    }
+
+    const selectedRoute = await chooseRouteCandidate(candidates, {
+      scoreAllCandidates: true,
+    });
 
     return NextResponse.json({
       success: true,
-      orsRoute: orsData,
+      orsRoute: selectedRoute.routeData,
+      trafficAssessment: selectedRoute.trafficAssessment,
+      routeDecision: selectedRoute.routeDecision,
     });
   } catch (error: unknown) {
     console.error("REROUTE SERVER ERROR:", error);

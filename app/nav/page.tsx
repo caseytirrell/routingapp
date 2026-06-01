@@ -22,7 +22,7 @@ import {
   saveAppLanguage,
   type AppLanguage,
 } from "@/lib/i18n";
-import { properties, startCoordsMap } from "@/lib/stops";
+import { nurseryStop, properties, startCoordsMap } from "@/lib/stops";
 import type {
   AppRoute,
   Coordinate,
@@ -127,7 +127,10 @@ export default function NavPage() {
   const [routeMode, setRouteMode] = useState<"single" | "full">("single");
   const [followTruck, setFollowTruck] = useState(true);
   const [mapReady, setMapReady] = useState(false);
-  const [availableStops, setAvailableStops] = useState<StopOption[]>(properties);
+  const [availableStops, setAvailableStops] = useState<StopOption[]>([
+    nurseryStop,
+    ...properties,
+  ]);
   const [truckLocation, setTruckLocation] = useState<[number, number] | null>(null);
   const truckAnimationRef = useRef<[number, number] | null>(null);
   const [currentLegIndex, setCurrentLegIndex] = useState(0);
@@ -226,11 +229,12 @@ export default function NavPage() {
       console.log("RESTORED crewRouteState IN NAV:", parsed);
 
       if (parsed.customStops?.length) {
+        const baseStops = [nurseryStop, ...properties];
         const mergedStops = [
-          ...properties,
+          ...baseStops,
           ...parsed.customStops.filter(
             (savedStop) =>
-              !properties.some((property) => property.address === savedStop.address)
+              !baseStops.some((stop) => stop.address === savedStop.address)
           ),
         ];
 
