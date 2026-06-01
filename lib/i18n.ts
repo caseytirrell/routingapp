@@ -51,6 +51,7 @@ export const pageText = {
     closeAddStop: "Close Add Stop",
     noStopsAvailable: "Every available stop is already in the plan.",
     reOptimizeRemaining: "Re-optimize Remaining Stops",
+    reOptimizingRemaining: "Re-optimizing remaining stops...",
     openNavigation: "Open Navigation",
     currentRoute: "Current Route",
     optimizedRoute: "Today's Stop Order",
@@ -58,6 +59,8 @@ export const pageText = {
     startDrive: "Start Drive",
     startingDrive: "Starting Drive...",
     missingStopCoordinates: "Could not find coordinates for that stop.",
+    confirmOutOfOrderDrive: (selected: string, recommended: string) =>
+      `The recommended next stop is ${recommended}. Start a drive to ${selected} instead?`,
     routeOrderChanged: "Route order changed. Rebuild the route before opening navigation.",
     rebuilding: "Rebuilding...",
     rebuildRoute: "Rebuild Route",
@@ -122,6 +125,7 @@ export const pageText = {
     closeAddStop: "Cerrar lista",
     noStopsAvailable: "Todas las paradas disponibles ya están en el plan.",
     reOptimizeRemaining: "Reoptimizar paradas restantes",
+    reOptimizingRemaining: "Reoptimizando las paradas restantes...",
     openNavigation: "Abrir navegación",
     currentRoute: "Ruta actual",
     optimizedRoute: "Orden de paradas de hoy",
@@ -129,6 +133,8 @@ export const pageText = {
     startDrive: "Iniciar viaje",
     startingDrive: "Iniciando viaje...",
     missingStopCoordinates: "No se encontraron coordenadas para esa parada.",
+    confirmOutOfOrderDrive: (selected: string, recommended: string) =>
+      `La próxima parada recomendada es ${recommended}. ¿Iniciar un viaje a ${selected} en su lugar?`,
     routeOrderChanged: "El orden cambió. Reconstruye la ruta antes de abrir la navegación.",
     rebuilding: "Reconstruyendo...",
     rebuildRoute: "Reconstruir ruta",
@@ -197,6 +203,7 @@ export const navText = {
     atStop: "You appear to be at this stop.",
     confirmArrived: (feet: number) =>
       `It looks like you are still about ${feet} feet from the stop. Are you sure you want to mark this as arrived?`,
+    confirmCompleteRoute: "Complete this route and return to the stop list?",
     navigationStarted: "Navigation started.",
     navigationPaused: "Navigation paused.",
     navigationResumed: "Navigation resumed.",
@@ -246,6 +253,7 @@ export const navText = {
     atStop: "Parece que llegaste a esta parada.",
     confirmArrived: (feet: number) =>
       `Parece que todavía estás a unos ${feet} pies de la parada. ¿Seguro que quieres marcar llegada?`,
+    confirmCompleteRoute: "¿Completar esta ruta y volver a la lista de paradas?",
     navigationStarted: "Navegación iniciada.",
     navigationPaused: "Navegación pausada.",
     navigationResumed: "Navegación reanudada.",

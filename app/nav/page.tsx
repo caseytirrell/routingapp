@@ -1157,6 +1157,10 @@ export default function NavPage() {
   };
 
   const completeCurrentDrive = () => {
+    if (!window.confirm(t.confirmCompleteRoute)) {
+      return;
+    }
+
     if (dayPlanStopAddress) {
       finishDayPlanDrive();
       return;

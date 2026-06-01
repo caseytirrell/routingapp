@@ -738,6 +738,15 @@ export default function Home() {
 
   const startDayPlanDrive = async (address: string) => {
     const coords = stopMap.get(address);
+    const recommendedAddress = dayPlan?.route_order[0];
+
+    if (
+      recommendedAddress &&
+      recommendedAddress !== address &&
+      !window.confirm(t.confirmOutOfOrderDrive(address, recommendedAddress))
+    ) {
+      return;
+    }
 
     if (!currentLocation) {
       setError(t.waitingForLocation);
@@ -1361,6 +1370,11 @@ export default function Home() {
                 </h2>
                 {routeMode === "full" && (
                   <>
+                    {(dayPlanNeedsReoptimization || rebuildingRoute) && (
+                      <div className="mb-4 rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-sm font-semibold text-amber-800">
+                        {t.reOptimizingRemaining}
+                      </div>
+                    )}
                     <div className="mb-4 grid grid-cols-2 gap-2">
                       <button
                         type="button"
@@ -1487,7 +1501,7 @@ export default function Home() {
                             <button
                               type="button"
                               onClick={() => startDayPlanDrive(stop)}
-                              disabled={startingDayPlanAddress !== null}
+                              disabled={startingDayPlanAddress !== null || rebuildingRoute}
                               className="shrink-0 rounded-lg bg-blue-700 px-3 py-2 text-xs font-semibold text-white transition hover:bg-blue-800 disabled:cursor-not-allowed disabled:opacity-50"
                             >
                               {startingDayPlanAddress === stop ? t.startingDrive : t.startDrive}
