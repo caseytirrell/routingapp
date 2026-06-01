@@ -39,6 +39,10 @@ export type Route = {
   distance?: number;
   duration?: number;
   time?: number;
+  summary?: {
+    distance?: number;
+    duration?: number;
+  };
 };
 
 export type AppRoute = {
@@ -62,10 +66,43 @@ export type TrafficAssessment = {
   routeAttempt: number;
 };
 
+export type CommercialValidationStatus = "passed" | "rejected" | "unknown";
+
+export type CommercialRestrictionValidation = {
+  status: CommercialValidationStatus;
+  reason: string;
+  matchedRules: string[];
+};
+
+export type RouteDecisionCandidate = {
+  id: string;
+  provider: "ors" | "geoapify" | "google";
+  label: string;
+  selected: boolean;
+  accepted: boolean;
+  rejectionReason: string | null;
+  distanceMeters: number | null;
+  routeDurationSeconds: number | null;
+  tomTomTravelTimeSeconds: number | null;
+  tomTomDelaySeconds: number | null;
+  tomTomDelayRatio: number | null;
+  commercialValidation: CommercialRestrictionValidation;
+  trafficAssessment: TrafficAssessment;
+};
+
+export type RouteDecisionReport = {
+  selectedCandidateId: string | null;
+  selectedReason: string;
+  candidateCount: number;
+  scoredCandidateCount: number;
+  candidates: RouteDecisionCandidate[];
+};
+
 export type RouteApiResponse = {
   output?: RouteData;
   orsRoute?: AppRoute;
   trafficAssessment?: TrafficAssessment;
+  routeDecision?: RouteDecisionReport;
   error?: string;
 };
 

@@ -4,12 +4,22 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import maplibregl from "maplibre-gl";
 import { decodePolyline, getClosestPathIndex } from "@/lib/geo";
+import {
+  LANGUAGE_CHANGE_EVENT,
+  LANGUAGE_STORAGE_KEY,
+  languageLabels,
+  normalizeLanguage,
+  pageText,
+  saveAppLanguage,
+  type AppLanguage,
+} from "@/lib/i18n";
 import { nurseryStop, properties, startCoordsMap } from "@/lib/stops";
 import type {
   AppRoute,
   Coordinate,
   RouteApiResponse,
   RouteData,
+  RouteDecisionReport,
   StopOption,
   TrafficAssessment,
 } from "@/lib/route-types";
@@ -43,7 +53,11 @@ export default function Home() {
   const [orsRoute, setOrsRoute] = useState<AppRoute | null>(null);
   const [routeData, setRouteData] = useState<RouteData | null>(null);
   const [trafficAssessment, setTrafficAssessment] = useState<TrafficAssessment | null>(null);
+  const [routeDecision, setRouteDecision] = useState<RouteDecisionReport | null>(null);
+  const [showDecisionDetails, setShowDecisionDetails] = useState(false);
   const [routeNeedsRebuild, setRouteNeedsRebuild] = useState(false);
+  const [language, setLanguage] = useState<AppLanguage>("en");
+  const t = pageText[language];
 
   const stopMap = useMemo(
     () =>
@@ -69,6 +83,25 @@ export default function Home() {
     }, 1000);
 
     return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    setLanguage(normalizeLanguage(localStorage.getItem(LANGUAGE_STORAGE_KEY)));
+
+    const handleLanguageChange = (event: Event) => {
+      const nextLanguage = normalizeLanguage(
+        event instanceof CustomEvent ? event.detail : localStorage.getItem(LANGUAGE_STORAGE_KEY)
+      );
+      setLanguage(nextLanguage);
+    };
+
+    window.addEventListener(LANGUAGE_CHANGE_EVENT, handleLanguageChange);
+    window.addEventListener("storage", handleLanguageChange);
+
+    return () => {
+      window.removeEventListener(LANGUAGE_CHANGE_EVENT, handleLanguageChange);
+      window.removeEventListener("storage", handleLanguageChange);
+    };
   }, []);
 
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
@@ -431,6 +464,10 @@ export default function Home() {
       if (parsed.routeData) setRouteData(parsed.routeData);
       if (parsed.orsRoute) setOrsRoute(parsed.orsRoute);
       if (parsed.trafficAssessment) setTrafficAssessment(parsed.trafficAssessment);
+      if (parsed.routeDecision) setRouteDecision(parsed.routeDecision);
+      if (typeof parsed.showDecisionDetails === "boolean") {
+        setShowDecisionDetails(parsed.showDecisionDetails);
+      }
       if (typeof parsed.currentLegIndex === "number") {
         setCurrentLegIndex(parsed.currentLegIndex);
       }
@@ -454,6 +491,8 @@ export default function Home() {
       routeData,
       orsRoute,
       trafficAssessment,
+      routeDecision,
+      showDecisionDetails,
       currentLegIndex,
       followTruck,
       customStops,
@@ -462,7 +501,7 @@ export default function Home() {
 
     console.log("SAVING crewRouteState:", navigationState);
     localStorage.setItem("crewRouteState", JSON.stringify(navigationState));
-  }, [start, routeData, orsRoute, trafficAssessment, currentLegIndex, followTruck, customStops, routeMode]);
+  }, [start, routeData, orsRoute, trafficAssessment, routeDecision, showDecisionDetails, currentLegIndex, followTruck, customStops, routeMode]);
 
   const date = currentDateTime
     ? currentDateTime.toLocaleDateString()
@@ -493,12 +532,12 @@ export default function Home() {
 
   const testRoute = async () => {
     if (selectedStops.length === 0) {
-      setError(routeMode === "single" ? "Select a destination before creating a route." : "Select at least one stop before optimizing.");
+      setError(routeMode === "single" ? t.selectDestinationError : t.selectStopError);
       return;
     }
 
     if (routeMode === "single" && selectedStops.length !== 1) {
-      setError("Single stop mode routes to one destination at a time.");
+      setError(t.singleStopOnlyError);
       return;
     }
 
@@ -510,12 +549,13 @@ export default function Home() {
     setRouteData(null);
     setOrsRoute(null);
     setTrafficAssessment(null);
+    setRouteDecision(null);
     setRouteNeedsRebuild(false);
     setError("");
 
     if (routeMode === "single" && !currentLocation) {
       setLoading(false);
-      setError("Waiting for the iPad location before creating a route.");
+      setError(t.waitingForLocation);
       return;
     }
 
@@ -532,6 +572,8 @@ export default function Home() {
       preserveOrder: routeMode === "single",
       originCoords: routeMode === "single" ? currentLocation : undefined,
       returnToStart: routeMode === "full",
+      includeDecisionReport: showDecisionDetails,
+      language,
     };
 
     try {
@@ -554,11 +596,12 @@ export default function Home() {
         ...data.output,
         reason:
           routeMode === "single"
-            ? "Single stop route from current iPad location."
+            ? t.singleStopReason
             : data.output.reason,
       });
       setOrsRoute(data.orsRoute);
       setTrafficAssessment(data.trafficAssessment ?? null);
+      setRouteDecision(data.routeDecision ?? null);
       setRouteNeedsRebuild(false);
       setSelectedStops([]);
       console.log("ROUTE DATA BEING SET:", data.output);
@@ -607,6 +650,8 @@ export default function Home() {
           start,
           stops: orderedStops,
           preserveOrder: true,
+          includeDecisionReport: showDecisionDetails,
+          language,
         }),
       });
 
@@ -619,6 +664,7 @@ export default function Home() {
       setRouteData(data.output);
       setOrsRoute(data.orsRoute);
       setTrafficAssessment(data.trafficAssessment ?? null);
+      setRouteDecision(data.routeDecision ?? null);
       setRouteNeedsRebuild(false);
     } catch (error: unknown) {
       setError(getErrorMessage(error));
@@ -630,6 +676,40 @@ export default function Home() {
   function getErrorMessage(error: unknown): string {
     return error instanceof Error ? error.message : "Something went wrong...";
   }
+
+  const formatMinutes = (seconds: number | null) => {
+    if (seconds === null) return "N/A";
+
+    return `${Math.round(seconds / 60)} min`;
+  };
+
+  const formatDistance = (meters: number | null) => {
+    if (meters === null) return "N/A";
+
+    const miles = meters / 1609.344;
+
+    return `${miles.toFixed(1)} mi`;
+  };
+
+  const selectedDecisionCandidate =
+    routeDecision?.candidates.find((candidate) => candidate.selected) ?? null;
+  const selectedEtaSeconds =
+    selectedDecisionCandidate?.routeDurationSeconds ??
+    trafficAssessment?.travelTimeSeconds ??
+    null;
+  const selectedDelayMinutes =
+    trafficAssessment?.delaySeconds === null ||
+    trafficAssessment?.delaySeconds === undefined
+      ? null
+      : Math.round(trafficAssessment.delaySeconds / 60);
+  const trafficLabel =
+    selectedDelayMinutes === null
+      ? t.checking
+      : selectedDelayMinutes <= 3
+        ? t.light
+        : selectedDelayMinutes <= 10
+          ? t.moderate
+          : t.heavy;
 
   const filteredProperties = properties.filter((property) => {
     const search = propertySearch.trim().toLowerCase();
@@ -649,6 +729,8 @@ export default function Home() {
   const setStopSelection = (stop: StopOption) => {
     setRouteData(null);
     setOrsRoute(null);
+    setTrafficAssessment(null);
+    setRouteDecision(null);
     setRouteNeedsRebuild(false);
     setError("");
 
@@ -684,35 +766,53 @@ export default function Home() {
     <main className="min-h-screen bg-slate-100 px-4 py-8">
       <div className="mx-auto max-w-7xl">
         <div className="mb-8 rounded-2xl bg-gradient-to-r from-slate-900 to-slate-700 p-6 text-white shadow-lg">
-          <h1 className="text-3xl font-bold tracking-tight">Crew Route Optimizer</h1>
-          <p className="mt-2 text-sm text-slate-200">
-            Route from the current iPad location or plan a full stop sequence.
-          </p>
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div>
+              <h1 className="text-3xl font-bold tracking-tight">{t.appTitle}</h1>
+              <p className="mt-2 text-sm text-slate-200">
+                {t.appSubtitle}
+              </p>
+            </div>
+            <label className="min-w-36 text-sm font-semibold text-slate-200">
+              <span className="mb-1 block">{t.language}</span>
+              <select
+                value={language}
+                onChange={(event) => saveAppLanguage(normalizeLanguage(event.target.value))}
+                className="w-full rounded-xl border border-white/20 bg-white/10 p-2 text-white"
+              >
+                {(["en", "es"] as const).map((option) => (
+                  <option key={option} value={option} className="text-slate-900">
+                    {languageLabels[option]}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
 
           <div className="mt-6 grid gap-4 md:grid-cols-4">
             <div className="rounded-xl bg-white/10 p-4 backdrop-blur-sm">
-              <p className="text-xs uppercase tracking-wide text-slate-300">Route Mode</p>
+              <p className="text-xs uppercase tracking-wide text-slate-300">{t.routeMode}</p>
               <p className="mt-1 text-sm font-semibold text-white">
-                {routeMode === "single" ? "Single Stop" : "Full Route"}
+                {routeMode === "single" ? t.singleStop : t.fullRoute}
               </p>
             </div>
 
             {routeMode === "full" && (
               <div className="rounded-xl bg-white/10 p-4 backdrop-blur-sm">
                 <p className="text-xs uppercase tracking-wide text-slate-300">
-                  Start Location
+                  {t.startLocation}
                 </p>
                 <p className="mt-1 text-sm font-semibold text-white">{start}</p>
               </div>
             )}
 
             <div className="rounded-xl bg-white/10 p-4 backdrop-blur-sm">
-              <p className="text-xs uppercase tracking-wide text-slate-300">Current Date</p>
+              <p className="text-xs uppercase tracking-wide text-slate-300">{t.currentDate}</p>
               <p className="mt-1 text-sm font-semibold text-white">{date}</p>
             </div>
 
             <div className="rounded-xl bg-white/10 p-4 backdrop-blur-sm">
-              <p className="text-xs uppercase tracking-wide text-slate-300">Current Time</p>
+              <p className="text-xs uppercase tracking-wide text-slate-300">{t.currentTime}</p>
               <p className="mt-1 text-sm font-semibold text-white">{time}</p>
             </div>
           </div>
@@ -722,7 +822,7 @@ export default function Home() {
           <div className="space-y-6">
             <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
               <label className="mb-2 block text-sm font-semibold text-slate-700">
-                Route Type
+                {t.routeType}
               </label>
               <div className="grid grid-cols-2 gap-2 rounded-xl bg-slate-100 p-1">
                 {(["single", "full"] as const).map((mode) => (
@@ -734,6 +834,8 @@ export default function Home() {
                       setSelectedStops([]);
                       setRouteData(null);
                       setOrsRoute(null);
+                      setTrafficAssessment(null);
+                      setRouteDecision(null);
                       setRouteNeedsRebuild(false);
                       setError("");
                     }}
@@ -743,7 +845,7 @@ export default function Home() {
                         : "bg-transparent text-slate-700 hover:bg-white"
                     }`}
                   >
-                    {mode === "single" ? "Single Stop" : "Full Route"}
+                    {mode === "single" ? t.singleStop : t.fullRoute}
                   </button>
                 ))}
               </div>
@@ -751,7 +853,7 @@ export default function Home() {
               {routeMode === "full" && (
                 <>
                   <label className="mt-6 mb-2 block text-sm font-semibold text-slate-700">
-                    Start Location
+                    {t.startLocation}
                   </label>
                   <select
                     value={start}
@@ -759,7 +861,7 @@ export default function Home() {
                     className="w-full rounded-xl border border-slate-300 bg-white p-3 text-slate-800 shadow-sm"
                   >
                     <option value="168 Heyers Mill Rd, Colts Neck, NJ 07722">
-                      Nursery
+                      {t.nursery}
                     </option>
                     <option value="475 South St, Morristown, NJ 07960">
                       Morristown
@@ -769,7 +871,7 @@ export default function Home() {
               )}
 
               <label className="mt-6 mb-3 block text-sm font-semibold text-slate-700">
-                Add Custom Address
+                {t.addCustomAddress}
               </label>
 
               <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
@@ -777,18 +879,18 @@ export default function Home() {
                   type="text"
                   value={customAddressSearch}
                   onChange={(e) => setCustomAddressSearch(e.target.value)}
-                  placeholder="Search for a new address"
+                  placeholder={t.searchNewAddress}
                   className="mb-3 w-full rounded-xl border border-slate-300 bg-white p-3 text-slate-800"
                 />
 
                 {isSearchingAddresses && (
-                  <p className="mb-3 text-sm text-slate-500">Searching addresses...</p>
+                  <p className="mb-3 text-sm text-slate-500">{t.searchingAddresses}</p>
                 )}
 
                 {!isSearchingAddresses &&
                   customAddressSearch.trim().length >= 3 &&
                   customAddressSuggestions.length === 0 && (
-                    <p className="mb-3 text-sm text-slate-500">No address matches found.</p>
+                    <p className="mb-3 text-sm text-slate-500">{t.noAddressMatches}</p>
                   )}
 
                 {customAddressSuggestions.length > 0 && (
@@ -810,7 +912,7 @@ export default function Home() {
                         }}
                         className="block w-full rounded-xl border border-slate-200 bg-white p-3 text-left transition hover:bg-slate-100"
                       >
-                        <div className="font-semibold text-slate-800">Custom Address</div>
+                        <div className="font-semibold text-slate-800">{t.customAddress}</div>
                         <div className="text-sm text-slate-500">{suggestion.address}</div>
                       </button>
                     ))}
@@ -821,7 +923,7 @@ export default function Home() {
               {customStops.length > 0 && (
                 <div className="mt-6 rounded-xl border border-slate-200 bg-slate-50 p-4">
                   <label className="mb-3 block text-sm font-semibold text-slate-700">
-                    Custom Stops Added
+                    {t.customStopsAdded}
                   </label>
 
                   <div className="space-y-2">
@@ -831,7 +933,7 @@ export default function Home() {
                         className="flex items-center justify-between rounded-xl border border-slate-200 bg-white p-3"
                       >
                         <div>
-                          <div className="font-semibold text-slate-800">Custom Address</div>
+                          <div className="font-semibold text-slate-800">{t.customAddress}</div>
                           <div className="text-sm text-slate-500">{stop.address}</div>
                         </div>
                         <div className="flex shrink-0 items-center gap-2">
@@ -842,7 +944,7 @@ export default function Home() {
                             }}
                             className="rounded-lg bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-800"
                           >
-                            Add
+                            {t.add}
                           </button>
 
                           <button
@@ -858,7 +960,7 @@ export default function Home() {
                             }}
                             className="rounded-lg bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700"
                           >
-                            Remove
+                            {t.remove}
                           </button>
                         </div>
                       </div>
@@ -868,7 +970,7 @@ export default function Home() {
               )}
 
               <label className="mt-6 mb-3 block text-sm font-semibold text-slate-700">
-                {routeMode === "single" ? "Choose Destination" : "Select Properties"}
+                {routeMode === "single" ? t.chooseDestination : t.selectProperties}
               </label>
               <div className="mb-4">
                 <button
@@ -878,9 +980,9 @@ export default function Home() {
                 >
                   {routeMode === "single"
                     ? selectedStops[0]?.address === nurseryStop.address
-                      ? "Nursery Selected"
-                      : "Route to Nursery"
-                    : `Add Nursery Stop${nurserySelectedCount > 0 ? ` (${nurserySelectedCount})` : ""}`}
+                      ? t.nurserySelected
+                      : t.routeToNursery
+                    : `${t.addNurseryStop}${nurserySelectedCount > 0 ? ` (${nurserySelectedCount})` : ""}`}
                 </button>
               </div>
               <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
@@ -922,7 +1024,7 @@ export default function Home() {
             <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
               <div className="flex items-center justify-between gap-3">
                 <h2 className="text-lg font-semibold text-slate-900">
-                  {routeMode === "single" ? "Destination" : "Selected Stops"}
+                  {routeMode === "single" ? t.destination : t.selectedStops}
                 </h2>
                 <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-semibold text-slate-600">
                   {selectedStops.length}
@@ -932,8 +1034,8 @@ export default function Home() {
               {selectedStops.length === 0 ? (
                 <p className="mt-4 text-sm text-slate-500">
                   {routeMode === "single"
-                    ? "Choose one destination to route from the current iPad location."
-                    : "No stops selected yet."}
+                    ? t.chooseOneDestination
+                    : t.noStopsSelected}
                 </p>
               ) : (
                 <div className="mt-4 space-y-2">
@@ -965,7 +1067,7 @@ export default function Home() {
                           }}
                           className="shrink-0 rounded-lg border border-red-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-red-600 hover:bg-red-50"
                         >
-                          Remove
+                          {t.remove}
                         </button>
                       </div>
                     </div>
@@ -974,12 +1076,29 @@ export default function Home() {
               )}
             </div>
             <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-              <h2 className="text-lg font-semibold text-slate-900">Route Actions</h2>
+              <h2 className="text-lg font-semibold text-slate-900">{t.routeActions}</h2>
               <p className="mt-1 text-sm text-slate-500">
                 {routeMode === "single"
-                  ? "Create a route from the current iPad location to the chosen destination."
-                  : "Optimize your selected stops and open turn by turn navigation."}
+                  ? t.singleActionHelp
+                  : t.fullActionHelp}
               </p>
+
+              <label className="mt-5 flex items-start gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
+                <input
+                  type="checkbox"
+                  checked={showDecisionDetails}
+                  onChange={(event) => setShowDecisionDetails(event.target.checked)}
+                  className="mt-1 h-4 w-4 rounded border-slate-300"
+                />
+                <span>
+                  <span className="block text-sm font-semibold text-slate-800">
+                    {t.routeDecisionDetails}
+                  </span>
+                  <span className="mt-1 block text-xs text-slate-500">
+                    {t.candidateScoringReport}
+                  </span>
+                </span>
+              </label>
 
               <div className="mt-6 flex flex-col gap-3">
                 <button
@@ -989,11 +1108,11 @@ export default function Home() {
                 >
                   {loading
                     ? routeMode === "single"
-                      ? "Creating Route..."
-                      : "Optimizing..."
+                      ? t.creatingRoute
+                      : t.optimizing
                     : routeMode === "single"
-                      ? "Create Route"
-                      : "Optimize Route"}
+                      ? t.createRoute
+                      : t.optimizeRoute}
                 </button>
 
                 <button
@@ -1001,7 +1120,7 @@ export default function Home() {
                   disabled={!routeData || !orsRoute || routeNeedsRebuild}
                   className="rounded-xl bg-blue-700 px-4 py-3 font-medium text-white transition hover:bg-blue-800 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  Open Navigation
+                  {t.openNavigation}
                 </button>
               </div>
 
@@ -1014,12 +1133,12 @@ export default function Home() {
             {routeData && (
               <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
                 <h2 className="mb-3 text-lg font-semibold text-slate-900">
-                  {routeMode === "single" ? "Current Route" : "Optimized Route"}
+                  {routeMode === "single" ? t.currentRoute : t.optimizedRoute}
                 </h2>
                 {routeMode === "full" && routeNeedsRebuild && (
                   <div className = "mb-4 rounded-xl border border-amber-300 bg-amber-50 p-3">
                   <p className="mb-4 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800">
-                    Route order changed. Rebuild the route before opening navigation.
+                    {t.routeOrderChanged}
                   </p>
                   <button
                     type="button"
@@ -1027,7 +1146,7 @@ export default function Home() {
                     disabled={rebuildingRoute}
                     className="mt-3 w-full rounded-xl bg-amber-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-50"
                   >
-                    {rebuildingRoute ? "Rebuilding..." : "Rebuild Route"}
+                    {rebuildingRoute ? t.rebuilding : t.rebuildRoute}
                   </button>
                 </div>
                 )}
@@ -1050,7 +1169,7 @@ export default function Home() {
                                 isNursery ? "text-emerald-700" : "text-slate-900"
                               }`}
                             >
-                              {isNursery ? "Nursery Stop" : "Stop"}
+                              {isNursery ? t.nurseryStop : t.stop}
                             </div>
                             <div className="mt-0.5 text-xs text-slate-500">
                               {stop}
@@ -1082,7 +1201,7 @@ export default function Home() {
                             }}
                             className="rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-xs font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
                           >
-                            Up
+                            {t.up}
                           </button>
                           <button
                             type="button"
@@ -1107,7 +1226,7 @@ export default function Home() {
                             }}
                             className="rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-xs font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
                           >
-                            Down
+                            {t.down}
                           </button>
                           <button
                             type="button"
@@ -1127,7 +1246,7 @@ export default function Home() {
                             }}
                             className="rounded-lg border border-red-300 bg-white px-2 py-1.5 text-xs font-semibold text-red-600 hover:bg-red-50"
                           >
-                            Remove
+                            {t.remove}
                           </button>
                           </div>
                         )}
@@ -1137,15 +1256,20 @@ export default function Home() {
                 </div>
                 <div className="mt-4 rounded-xl bg-slate-50 p-4">
                   <p className="text-sm text-slate-700">
-                    <strong>Reason:</strong> {routeData.reason}
+                    <strong>{t.reason}:</strong> {routeData.reason}
                   </p>
                 </div>
                 {trafficAssessment && (
                   <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4">
                     <div className="flex items-center justify-between gap-3">
-                      <p className="text-sm font-semibold text-slate-900">
-                        TomTom Traffic
-                      </p>
+                      <div>
+                        <p className="text-sm font-semibold text-slate-900">
+                          {t.routeReady}
+                        </p>
+                        <p className="mt-1 text-2xl font-bold text-slate-900">
+                          {t.eta} {formatMinutes(selectedEtaSeconds)}
+                        </p>
+                      </div>
                       <span
                         className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
                           trafficAssessment.status === "accepted"
@@ -1155,19 +1279,126 @@ export default function Home() {
                               : "bg-slate-100 text-slate-600"
                         }`}
                       >
-                        {trafficAssessment.status}
+                        {trafficLabel} {t.traffic}
                       </span>
                     </div>
-                    <p className="mt-2 text-sm text-slate-600">
-                      {trafficAssessment.reason}
-                    </p>
-                    {trafficAssessment.delayRatio !== null && (
-                      <p className="mt-1 text-xs text-slate-500">
-                        Delay: {Math.round((trafficAssessment.delaySeconds ?? 0) / 60)} min,
-                        {" "}
-                        {Math.round(trafficAssessment.delayRatio * 100)}% over no-traffic time
+                    {selectedDelayMinutes !== null && selectedDelayMinutes > 0 && (
+                      <p className="mt-2 text-sm text-slate-600">
+                        {t.trafficDelay(selectedDelayMinutes)}
                       </p>
                     )}
+                  </div>
+                )}
+                {showDecisionDetails && routeDecision && (
+                  <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-sm font-semibold text-slate-900">
+                          Route Decision
+                        </p>
+                        <p className="mt-1 text-xs text-slate-500">
+                          {routeDecision.scoredCandidateCount} of {routeDecision.candidateCount} candidates scored
+                        </p>
+                      </div>
+                      <span className="rounded-full bg-blue-100 px-2.5 py-1 text-xs font-semibold text-blue-700">
+                        {routeDecision.selectedCandidateId ?? "none"}
+                      </span>
+                    </div>
+
+                    <p className="mt-3 rounded-lg bg-slate-50 p-3 text-sm text-slate-700">
+                      {routeDecision.selectedReason}
+                    </p>
+
+                    <div className="mt-4 space-y-3">
+                      {routeDecision.candidates.map((candidate) => (
+                        <div
+                          key={candidate.id}
+                          className={`rounded-xl border p-3 ${
+                            candidate.selected
+                              ? "border-blue-300 bg-blue-50"
+                              : "border-slate-200 bg-slate-50"
+                          }`}
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <p className="text-sm font-semibold text-slate-900">
+                                {candidate.label}
+                              </p>
+                              <p className="mt-1 text-xs text-slate-500">
+                                {formatDistance(candidate.distanceMeters)} · Route ETA {formatMinutes(candidate.routeDurationSeconds)}
+                              </p>
+                            </div>
+                            <div className="flex shrink-0 gap-2">
+                              {candidate.selected && (
+                                <span className="rounded-full bg-blue-600 px-2 py-1 text-xs font-semibold text-white">
+                                  chosen
+                                </span>
+                              )}
+                              <span
+                                className={`rounded-full px-2 py-1 text-xs font-semibold ${
+                                  candidate.accepted
+                                    ? "bg-emerald-100 text-emerald-700"
+                                    : "bg-amber-100 text-amber-800"
+                                }`}
+                              >
+                                {candidate.accepted ? "accepted" : "rejected"}
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
+                            <div className="rounded-lg bg-white p-2">
+                              <p className="font-semibold text-slate-500">TomTom ETA</p>
+                              <p className="mt-1 text-slate-900">
+                                {formatMinutes(candidate.tomTomTravelTimeSeconds)}
+                              </p>
+                            </div>
+                            <div className="rounded-lg bg-white p-2">
+                              <p className="font-semibold text-slate-500">Delay</p>
+                              <p className="mt-1 text-slate-900">
+                                {formatMinutes(candidate.tomTomDelaySeconds)}
+                              </p>
+                            </div>
+                            <div className="rounded-lg bg-white p-2">
+                              <p className="font-semibold text-slate-500">Overage</p>
+                              <p className="mt-1 text-slate-900">
+                                {candidate.tomTomDelayRatio === null
+                                  ? "N/A"
+                                  : `${Math.round(candidate.tomTomDelayRatio * 100)}%`}
+                              </p>
+                            </div>
+                          </div>
+
+                          <div className="mt-3 rounded-lg bg-white p-2 text-xs">
+                            <div className="flex items-center justify-between gap-2">
+                              <p className="font-semibold text-slate-500">
+                                Commercial Check
+                              </p>
+                              <span
+                                className={`rounded-full px-2 py-0.5 font-semibold ${
+                                  candidate.commercialValidation.status === "passed"
+                                    ? "bg-emerald-100 text-emerald-700"
+                                    : candidate.commercialValidation.status === "rejected"
+                                      ? "bg-red-100 text-red-700"
+                                      : "bg-slate-100 text-slate-600"
+                                }`}
+                              >
+                                {candidate.commercialValidation.status}
+                              </span>
+                            </div>
+                            <p className="mt-1 text-slate-600">
+                              {candidate.commercialValidation.reason}
+                            </p>
+                          </div>
+
+                          {candidate.rejectionReason && (
+                            <p className="mt-3 text-xs text-slate-600">
+                              {candidate.rejectionReason}
+                            </p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 )}
               </div>

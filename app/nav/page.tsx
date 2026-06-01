@@ -13,6 +13,15 @@ import {
   getDistanceInFeet,
   getUpcomingPathBearing,
 } from "@/lib/geo";
+import {
+  LANGUAGE_CHANGE_EVENT,
+  LANGUAGE_STORAGE_KEY,
+  languageLabels,
+  navText,
+  normalizeLanguage,
+  saveAppLanguage,
+  type AppLanguage,
+} from "@/lib/i18n";
 import { properties, startCoordsMap } from "@/lib/stops";
 import type {
   AppRoute,
@@ -126,6 +135,8 @@ export default function NavPage() {
   const [navigationStarted, setNavigationStarted] = useState(false);
   const [navigationPaused, setNavigationPaused] = useState(false);
   const [navigationError, setNavigationError] = useState("");
+  const [language, setLanguage] = useState<AppLanguage>("en");
+  const t = navText[language];
 
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
@@ -154,6 +165,38 @@ export default function NavPage() {
   const ARRIVAL_STRONG_SUGGESTION_THRESHOLD_FEET = 75;
   const REROUTE_DISTANCE_THRESHOLD_FEET = 125;
   const REROUTE_COOLDOWN_MS = 3000;
+  const spokenTurnThresholdsRef = useRef<Set<string>>(new Set());
+  const spokenArrivalRef = useRef<string | null>(null);
+
+  const speakPrompt = useCallback((message: string) => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+
+    window.speechSynthesis.cancel();
+
+    const utterance = new SpeechSynthesisUtterance(message);
+    utterance.lang = language === "es" ? "es-US" : "en-US";
+    utterance.rate = 0.9;
+    window.speechSynthesis.speak(utterance);
+  }, [language]);
+
+  useEffect(() => {
+    setLanguage(normalizeLanguage(localStorage.getItem(LANGUAGE_STORAGE_KEY)));
+
+    const handleLanguageChange = (event: Event) => {
+      const nextLanguage = normalizeLanguage(
+        event instanceof CustomEvent ? event.detail : localStorage.getItem(LANGUAGE_STORAGE_KEY)
+      );
+      setLanguage(nextLanguage);
+    };
+
+    window.addEventListener(LANGUAGE_CHANGE_EVENT, handleLanguageChange);
+    window.addEventListener("storage", handleLanguageChange);
+
+    return () => {
+      window.removeEventListener(LANGUAGE_CHANGE_EVENT, handleLanguageChange);
+      window.removeEventListener("storage", handleLanguageChange);
+    };
+  }, []);
 
   useEffect(() => {
     const query = addStopSearch.trim();
@@ -780,9 +823,9 @@ export default function NavPage() {
 
   const arrivalSuggestionText =
     arrivalSuggestionLevel === "strong"
-      ? "You appear to be at this stop."
+      ? t.atStop
       : arrivalSuggestionLevel === "near"
-        ? "You are close to this stop."
+        ? t.nearStop
         : null;
 
   const currentSegment = orsRoute?.routes?.[0]?.segments?.[currentLegIndex] ?? null;
@@ -846,6 +889,13 @@ export default function NavPage() {
         ? `${Math.round(nextTurnDistanceFeet)} ft`
         : `${(nextTurnDistanceFeet / 5280).toFixed(1)} mi`;
 
+  const nextTurnSpokenDistance =
+    nextTurnDistanceFeet === null
+      ? ""
+      : nextTurnDistanceFeet < 1000
+        ? `${Math.round(nextTurnDistanceFeet)} feet`
+        : `${(nextTurnDistanceFeet / 5280).toFixed(1)} miles`;
+
   const distanceFromCurrentLegFeet =
     truckLocation && currentLegPath.length > 1
       ? getDistanceFromPathFeet(truckLocation, currentLegPath)
@@ -889,6 +939,7 @@ export default function NavPage() {
           preserveOrder: routeMode === "single",
           returnToStart: routeMode === "full",
           stops: remainingStops,
+          language,
         }),
       });
 
@@ -971,6 +1022,7 @@ export default function NavPage() {
           preserveOrder: routeMode === "single",
           returnToStart: routeMode === "full",
           stops: updatedStops,
+          language,
         }),
       });
 
@@ -1011,6 +1063,7 @@ export default function NavPage() {
           truckLocation,
           destination: currentStopCoords,
           heading: currentTruckHeadingRef.current,
+          language,
         }),
       });
 
@@ -1060,7 +1113,7 @@ export default function NavPage() {
     } finally {
       setIsRerouting(false);
     }
-  }, [currentLegIndex, currentSegment, currentStopCoords, isRerouting, truckLocation]);
+  }, [currentLegIndex, currentSegment, currentStopCoords, isRerouting, language, truckLocation]);
 
   useEffect(() => {
     if (
@@ -1109,14 +1162,14 @@ export default function NavPage() {
     distanceFromCurrentLegFeet > REROUTE_DISTANCE_THRESHOLD_FEET;
 
   const routeStatusLabel = isRerouting
-    ? "Rerouting"
+    ? t.rerouting
     : isOffRoute
-      ? "Off route"
+      ? t.offRoute
       : navigationPaused
-        ? "Paused"
+        ? t.paused
         : navigationStarted
-          ? "On route"
-          : "Route ready";
+          ? t.onRoute
+          : t.routeReady;
 
   const routeStatusClassName = isRerouting
     ? "bg-amber-100 text-amber-800"
@@ -1127,6 +1180,69 @@ export default function NavPage() {
         : navigationStarted
           ? "bg-emerald-100 text-emerald-700"
           : "bg-blue-100 text-blue-700";
+
+  useEffect(() => {
+    spokenTurnThresholdsRef.current.clear();
+    spokenArrivalRef.current = null;
+  }, [currentLegIndex, currentStopAddress]);
+
+  useEffect(() => {
+    if (
+      !navigationStarted ||
+      navigationPaused ||
+      !nextTurnInstruction ||
+      nextTurnDistanceFeet === null
+    ) {
+      return;
+    }
+
+    const thresholds = [
+      { id: "one-mile", feet: 5280 },
+      { id: "half-mile", feet: 2640 },
+      { id: "quarter-mile", feet: 1320 },
+      { id: "five-hundred-feet", feet: 500 },
+    ];
+
+    const threshold = thresholds.find((item) => {
+      const key = `${currentLegIndex}-${item.id}-${nextTurnInstruction}`;
+      return nextTurnDistanceFeet <= item.feet && !spokenTurnThresholdsRef.current.has(key);
+    });
+
+    if (!threshold) return;
+
+    const key = `${currentLegIndex}-${threshold.id}-${nextTurnInstruction}`;
+    spokenTurnThresholdsRef.current.add(key);
+    speakPrompt(t.turnPrompt(nextTurnSpokenDistance, nextTurnInstruction));
+  }, [
+    currentLegIndex,
+    navigationPaused,
+    navigationStarted,
+    nextTurnDistanceFeet,
+    nextTurnInstruction,
+    nextTurnSpokenDistance,
+    speakPrompt,
+    t,
+  ]);
+
+  useEffect(() => {
+    if (!navigationStarted || navigationPaused || !arrivalSuggestionLevel || !currentStopAddress) {
+      return;
+    }
+
+    const key = `${currentLegIndex}-${currentStopAddress}-${arrivalSuggestionLevel}`;
+    if (spokenArrivalRef.current === key) return;
+
+    spokenArrivalRef.current = key;
+    speakPrompt(t.closeToAddress(currentStopAddress));
+  }, [
+    arrivalSuggestionLevel,
+    currentLegIndex,
+    currentStopAddress,
+    navigationPaused,
+    navigationStarted,
+    speakPrompt,
+    t,
+  ]);
 
   return (
     <main className="relative h-[100dvh] w-full overflow-hidden bg-slate-100">
@@ -1139,16 +1255,16 @@ export default function NavPage() {
               onClick={() => router.push("/")}
               className="rounded-2xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 shadow-sm transition hover:bg-slate-50"
             >
-              Back
+              {t.back}
             </button>
 
             <div className="min-w-0 flex-1 text-center">
               <div className="truncate text-base font-semibold text-slate-900">
-                {currentStopAddress ?? "Return to start"}
+                {currentStopAddress ?? t.returnToStart}
               </div>
               <div className="mt-1 flex items-center justify-center gap-2 text-xs text-slate-500">
                 <span>
-                  Stop {Math.min(currentLegIndex + 1, totalLegs || 1)} of {totalLegs || 0}
+                  {t.stopProgress(Math.min(currentLegIndex + 1, totalLegs || 1), totalLegs || 0)}
                 </span>
 
                 <span className={`rounded-full px-2 py-0.5 font-semibold ${routeStatusClassName}`}>
@@ -1161,13 +1277,22 @@ export default function NavPage() {
                 if (!navigationStarted) {
                   setNavigationStarted(true);
                   setNavigationPaused(false);
+                  speakPrompt(
+                    nextTurnInstruction
+                      ? `${t.navigationStarted} ${nextTurnInstruction}${nextTurnSpokenDistance ? ` ${t.inDistance(nextTurnSpokenDistance).toLowerCase()}` : ""}.`
+                      : t.navigationStarted
+                  );
                 } else {
-                  setNavigationPaused((prev) => !prev);
+                  setNavigationPaused((prev) => {
+                    const nextPaused = !prev;
+                    speakPrompt(nextPaused ? t.navigationPaused : t.navigationResumed);
+                    return nextPaused;
+                  });
                 }
               }}
               className="rounded-2xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-800"
             >
-              {!navigationStarted ? "Start" : navigationPaused ? "Continue" : "Pause"}
+              {!navigationStarted ? t.start : navigationPaused ? t.continue : t.pause}
             </button>
             <button
               onClick={() => {
@@ -1194,20 +1319,31 @@ export default function NavPage() {
               }}
               className="rounded-2xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-700"
             >
-              Recenter
+              {t.recenter}
             </button>
+            <select
+              value={language}
+              onChange={(event) => saveAppLanguage(normalizeLanguage(event.target.value))}
+              className="rounded-2xl border border-slate-300 bg-white px-2 py-2 text-sm font-semibold text-slate-700 shadow-sm"
+            >
+              {(["en", "es"] as const).map((option) => (
+                <option key={option} value={option}>
+                  {languageLabels[option]}
+                </option>
+              ))}
+            </select>
             <button
               onClick={reOptimizeRemainingRoute}
               disabled={isReOptimizing}
               className="rounded-2xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-700"
             >
-              {isReOptimizing ? "Optimizing" : "Re Optimize"}
+              {isReOptimizing ? t.optimizing : t.reOptimize}
             </button>
           </div>
 
           <div className="mt-4">
             <div className="mb-2 flex items-center justify-between text-xs font-medium text-slate-500">
-              <span>Route Progress</span>
+              <span>{t.routeProgress}</span>
               <span>{Math.round(progressPercent)}%</span>
             </div>
             <div className="h-2 overflow-hidden rounded-full bg-slate-200">
@@ -1227,54 +1363,54 @@ export default function NavPage() {
               <span className="font-semibold text-slate-900">
                 {formatDistanceToNextStop(distanceToCurrentStopFeet)}
               </span>{" "}
-              to next stop
+              {t.toNextStop}
             </div>
             <div className="shrink-0 rounded-full bg-slate-100 px-2 py-1 text-slate-700">
-              {truckLocation ? "GPS on" : "Finding GPS"}
+              {truckLocation ? t.gpsOn : t.findingGps}
             </div>
           </div>
           <div className="mb-3 rounded-xl bg-slate-50 px-3 py-2">
             <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
-                Current Road
+                {t.currentRoad}
               </div>
               <div className="mt-1 text-sm font-medium text-slate-900">
-                {currentRoadName ?? "Unknown road"}
+                {currentRoadName ?? t.unknownRoad}
               </div>
             <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
-              Next Turn
+              {t.nextTurn}
             </div>
             <div className="mt-1 text-sm font-medium text-slate-900">
-              {nextTurnInstruction ?? "Continue on current road"}
+              {nextTurnInstruction ?? t.continueCurrentRoad}
             </div>
 
             {nextTurnDistanceLabel && (
               <div className="mt-1 text-xs font-semibold text-blue-700">
-                In {nextTurnDistanceLabel}
+                {t.inDistance(nextTurnDistanceLabel)}
               </div>
             )}
           </div>
           {showAddStopMenu && (
             <div className="mb-3 max-h-56 overflow-y-auto rounded-2xl border border-slate-200 bg-white p-2 shadow-inner">
               <div className="mb-2 px-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
-                Add a Stop
+                {t.addAStop}
               </div>
               <div className="mb-3 px-2">
                 <input
                   type="text"
                   value={addStopSearch}
                   onChange={(e) => setAddStopSearch(e.target.value)}
-                  placeholder="Search for a new address"
+                  placeholder={t.searchNewAddress}
                   className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm"
                 />
 
                 {isSearchingAddStopAddresses && (
-                  <p className="mt-2 text-xs text-slate-500">Searching addresses...</p>
+                  <p className="mt-2 text-xs text-slate-500">{t.searchingAddresses}</p>
                 )}
 
                 {!isSearchingAddStopAddresses &&
                   addStopSearch.trim().length >= 3 &&
                   addStopSuggestions.length === 0 && (
-                    <p className="mt-2 text-xs text-slate-500">No address matches found.</p>
+                    <p className="mt-2 text-xs text-slate-500">{t.noAddressMatches}</p>
                   )}
               </div>
               {addStopSuggestions.length > 0 && (
@@ -1300,7 +1436,7 @@ export default function NavPage() {
                       }`}
                     >
                       <div className="font-semibold">
-                        {addingStopAddress === suggestion.address ? "Adding..." : "Custom Address"}
+                        {addingStopAddress === suggestion.address ? t.adding : t.customAddress}
                       </div>
                       <div className="text-xs text-slate-500">{suggestion.address}</div>
                     </button>
@@ -1326,7 +1462,7 @@ export default function NavPage() {
                       }`}
                     >
                       <div className="font-semibold">
-                        {addingStopAddress === property.address ? "Adding..." : property.customerName}
+                        {addingStopAddress === property.address ? t.adding : property.customerName}
                       </div>
                       <div className="text-xs text-slate-500">{property.address}</div>
                     </button>
@@ -1342,7 +1478,7 @@ export default function NavPage() {
                 onClick={() => setNavigationError("")}
                 className="shrink-0 rounded-md border border-red-200 bg-white px-2 py-0.5 text-xs text-red-700"
               >
-                Dismiss
+                {t.dismiss}
               </button>
             </div>
           )}
@@ -1359,9 +1495,7 @@ export default function NavPage() {
                   distanceToCurrentStopFeet > 250
                 ) {
                   const confirmed = window.confirm(
-                    `It looks like you are still about ${Math.round(
-                      distanceToCurrentStopFeet
-                    )} feet from the stop. Are you sure you want to mark this as arrived?`
+                    t.confirmArrived(Math.round(distanceToCurrentStopFeet))
                   );
 
                   if (!confirmed) return;
@@ -1382,7 +1516,7 @@ export default function NavPage() {
                   : "bg-orange-600 hover:bg-orange-700"
               }`}
             >
-              Mark Arrived
+              {t.markArrived}
             </button>
             <button
               onClick={() => {
@@ -1397,7 +1531,7 @@ export default function NavPage() {
               }}
               className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-slate-50 sm:text-base"
             >
-              Skip Stop
+              {t.skipStop}
             </button>
             <button
               onClick={() => {
@@ -1414,7 +1548,7 @@ export default function NavPage() {
               }}
               className="rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-slate-50 sm:text-base"
             >
-              Add Stop
+              {t.addStop}
             </button>
             <button
               onClick={() => {
@@ -1423,7 +1557,7 @@ export default function NavPage() {
               }}
               className="rounded-2xl border border-red-300 bg-white px-4 py-3 text-sm font-semibold text-red-600 shadow-sm transition hover:bg-red-50 sm:text-base"
             >
-              {navigationStarted ? "End Route" : "Cancel"}
+              {navigationStarted ? t.endRoute : t.cancel}
             </button>
           </div>
         </div>

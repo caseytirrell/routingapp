@@ -1,5 +1,19 @@
 import { NextResponse } from "next/server";
+import { normalizeLanguage } from "@/lib/i18n";
 import type { Coordinate } from "@/lib/route-types";
+
+const ORS_SMALL_TRUCK_OPTIONS = {
+  vehicle_type: "delivery",
+  profile_params: {
+    restrictions: {
+      height: 2.7,
+      width: 2.2,
+      length: 8,
+      weight: 5,
+      axleload: 3,
+    },
+  },
+};
 
 type GeoapifyStep = {
   instruction?: {
@@ -182,11 +196,13 @@ async function getGeoapifyRoute(coordinates: [number, number][]) {
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { truckLocation, destination, heading } = body as {
+    const { truckLocation, destination, heading, language: rawLanguage } = body as {
       truckLocation: unknown;
       destination: unknown;
       heading?: number | null;
+      language?: unknown;
     };
+    const language = normalizeLanguage(rawLanguage);
 
     console.log("REROUTE INPUT:", { truckLocation, destination, heading });
 
@@ -208,6 +224,8 @@ export async function POST(request: Request) {
         },
         body: JSON.stringify({
           coordinates: [truckLocation, destination],
+          language,
+          options: ORS_SMALL_TRUCK_OPTIONS,
           ...(typeof heading === "number"
             ? {
                 bearings: [[Math.round(heading), 45]],

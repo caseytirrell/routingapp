@@ -1,10 +1,15 @@
 import OpenAI from "openai";
 import { NextResponse } from "next/server";
 import { decodePolyline } from "@/lib/geo";
+import { normalizeLanguage, type AppLanguage } from "@/lib/i18n";
 import type {
   AppRoute,
+  CommercialRestrictionValidation,
   Coordinate,
   Route,
+  RouteDecisionCandidate,
+  RouteDecisionReport,
+  RouteStep,
   RouteStopInput,
   TrafficAssessment,
 } from "@/lib/route-types";
@@ -12,7 +17,49 @@ import { NURSERY_ADDRESS, normalizeAddress, startCoordsMap } from "@/lib/stops";
 
 const USE_GEOAPIFY_ROUTING = false;
 const TOMTOM_TRAFFIC_THRESHOLD_RATIO = 0.25;
-const TOMTOM_MAX_SUPPORTING_POINTS = 100;
+const TOMTOM_MAX_SUPPORTING_POINTS = 50;
+const GOOGLE_CANDIDATE_LIMIT = 2;
+const GARDEN_STATE_PARKWAY_EXIT_105_LATITUDE = 40.283611;
+const GARDEN_STATE_PARKWAY_EXIT_105_BUFFER_DEGREES = 0.002;
+const ORS_SMALL_TRUCK_OPTIONS = {
+  vehicle_type: "delivery",
+  profile_params: {
+    restrictions: {
+      height: 2.7,
+      width: 2.2,
+      length: 8,
+      weight: 5,
+      axleload: 3,
+    },
+  },
+};
+
+const COMMERCIAL_RESTRICTION_RULES = [
+  {
+    id: "garden-state-parkway",
+    label: "Garden State Parkway",
+    patterns: [
+      /\bgarden state parkway\b/i,
+      /\bgarden state pkwy\b/i,
+      /\bgsp\b/i,
+    ],
+    type: "allowed-south-of-latitude",
+    maxLatitude: GARDEN_STATE_PARKWAY_EXIT_105_LATITUDE,
+    reason: "Garden State Parkway is allowed only south of Interchange 105 for the commercial restriction rule.",
+  },
+  {
+    id: "palisades-interstate-parkway",
+    label: "Palisades Interstate Parkway",
+    patterns: [
+      /\bpalisades interstate parkway\b/i,
+      /\bpalisades interstate pkwy\b/i,
+      /\bpalisades parkway\b/i,
+      /\bpalisades pkwy\b/i,
+    ],
+    type: "always-restricted",
+    reason: "Commercial traffic is prohibited on the Palisades Interstate Parkway.",
+  },
+];
 
 function getOpenAIClient() {
   const apiKey = process.env.OPENAI_API_KEY;
@@ -79,6 +126,59 @@ type TomTomRouteResponse = {
   error?: string;
 };
 
+type GoogleRouteStep = {
+  distanceMeters?: number;
+  staticDuration?: string;
+  localizedValues?: {
+    distance?: {
+      text?: string;
+    };
+    staticDuration?: {
+      text?: string;
+    };
+  };
+  polyline?: {
+    encodedPolyline?: string;
+  };
+  navigationInstruction?: {
+    instructions?: string;
+  };
+};
+
+type GoogleRouteLeg = {
+  distanceMeters?: number;
+  duration?: string;
+  staticDuration?: string;
+  polyline?: {
+    encodedPolyline?: string;
+  };
+  steps?: GoogleRouteStep[];
+};
+
+type GoogleRoute = {
+  distanceMeters?: number;
+  duration?: string;
+  staticDuration?: string;
+  polyline?: {
+    encodedPolyline?: string;
+  };
+  legs?: GoogleRouteLeg[];
+};
+
+type GoogleRouteResponse = {
+  routes?: GoogleRoute[];
+  error?: {
+    message?: string;
+    status?: string;
+  };
+};
+
+type RouteCandidateInput = {
+  route: Route;
+  provider: RouteDecisionCandidate["provider"];
+  label: string;
+};
+
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown error";
 }
@@ -94,6 +194,143 @@ function jsonError(message: string, status: number) {
 function getRouteGeometry(route: Route): Coordinate[] {
   if (Array.isArray(route.geometry)) return route.geometry;
   return decodePolyline(route.geometry);
+}
+
+function parseDurationSeconds(value: string | undefined): number | null {
+  if (!value) return null;
+
+  const match = value.match(/^(\d+(?:\.\d+)?)s$/);
+
+  if (!match) return null;
+
+  return Math.round(Number(match[1]));
+}
+
+function getRouteDistanceMeters(route: Route): number | null {
+  return route.distance ?? route.summary?.distance ?? null;
+}
+
+function getRouteDurationSeconds(route: Route): number | null {
+  return route.duration ?? route.time ?? route.summary?.duration ?? null;
+}
+
+function getRouteInstructionText(route: Route): string {
+  return (route.segments ?? [])
+    .flatMap((segment) => segment.steps ?? [])
+    .map((step) => {
+      const instruction =
+        typeof step.instruction === "string"
+          ? step.instruction
+          : step.instruction?.text;
+
+      return [instruction, step.name].filter(Boolean).join(" ");
+    })
+    .join(" ");
+}
+
+function getStepText(step: RouteStep): string {
+  const instruction =
+    typeof step.instruction === "string"
+      ? step.instruction
+      : step.instruction?.text;
+
+  return [instruction, step.name].filter(Boolean).join(" ");
+}
+
+function getMatchedStepCoordinates(route: Route, patterns: RegExp[]) {
+  const geometry = getRouteGeometry(route);
+  const matchedCoordinates: Coordinate[] = [];
+
+  for (const segment of route.segments ?? []) {
+    for (const step of segment.steps ?? []) {
+      const stepText = getStepText(step);
+
+      if (!patterns.some((pattern) => pattern.test(stepText))) continue;
+
+      const startIndex = step.way_points?.[0];
+      const endIndex = step.way_points?.[1];
+
+      if (typeof startIndex !== "number" || typeof endIndex !== "number") {
+        continue;
+      }
+
+      matchedCoordinates.push(
+        ...geometry.slice(
+          Math.max(0, startIndex),
+          Math.min(geometry.length, endIndex + 1)
+        )
+      );
+    }
+  }
+
+  return matchedCoordinates;
+}
+
+function validateCommercialRestrictions(route: Route): CommercialRestrictionValidation {
+  const instructionText = getRouteInstructionText(route);
+
+  if (!instructionText.trim()) {
+    return {
+      status: "unknown",
+      reason:
+        "Commercial validation could not inspect road names because this route did not include turn-by-turn road instructions.",
+      matchedRules: [],
+    };
+  }
+
+  const matchedRules = [];
+
+  for (const rule of COMMERCIAL_RESTRICTION_RULES) {
+    if (!rule.patterns.some((pattern) => pattern.test(instructionText))) {
+      continue;
+    }
+
+    if (rule.type === "allowed-south-of-latitude") {
+      if (typeof rule.maxLatitude !== "number") continue;
+
+      const coordinates = getMatchedStepCoordinates(route, rule.patterns);
+
+      if (coordinates.length === 0) {
+        matchedRules.push({
+          label: rule.label,
+          reason: `${rule.reason} The app could not confirm which section was used, so it rejected this candidate.`,
+        });
+        continue;
+      }
+
+      const maxLatitude = Math.max(...coordinates.map((coordinate) => coordinate[1]));
+      const cutoffLatitude =
+        rule.maxLatitude + GARDEN_STATE_PARKWAY_EXIT_105_BUFFER_DEGREES;
+
+      if (maxLatitude > cutoffLatitude) {
+        matchedRules.push({
+          label: rule.label,
+          reason: `${rule.reason} This route appears to use it north of Interchange 105.`,
+        });
+      }
+
+      continue;
+    }
+
+    matchedRules.push({
+      label: rule.label,
+      reason: rule.reason,
+    });
+  }
+
+  if (matchedRules.length > 0) {
+    return {
+      status: "rejected",
+      reason: matchedRules.map((rule) => rule.reason).join(" "),
+      matchedRules: matchedRules.map((rule) => rule.label),
+    };
+  }
+
+  return {
+    status: "passed",
+    reason: "No known commercial-restricted roads were found in the route instructions.",
+    matchedRules: [],
+  };
 }
 
 function sampleRouteGeometry(geometry: Coordinate[]) {
@@ -184,6 +421,26 @@ function scoreTomTomSummary(
   };
 }
 
+function createCommercialRejectedTrafficAssessment(
+  reason: string,
+  routeAttempt: number
+): TrafficAssessment {
+  return {
+    status: "rejected",
+    provider: "tomtom",
+    reason,
+    delaySeconds: null,
+    travelTimeSeconds: null,
+    noTrafficTravelTimeSeconds: null,
+    liveTrafficTravelTimeSeconds: null,
+    trafficDelaySeconds: null,
+    delayRatio: null,
+    trafficLengthMeters: null,
+    thresholdRatio: TOMTOM_TRAFFIC_THRESHOLD_RATIO,
+    routeAttempt,
+  };
+}
+
 async function assessRouteWithTomTom(
   route: Route,
   routeAttempt: number
@@ -245,48 +502,160 @@ async function assessRouteWithTomTom(
   return scoreTomTomSummary(summary, routeAttempt);
 }
 
-async function chooseTrafficAwareRoute(routeData: AppRoute): Promise<{
+function compareCandidatesByRouteEta(
+  a: { route: Route; assessment?: TrafficAssessment },
+  b: { route: Route; assessment?: TrafficAssessment }
+) {
+  const aRouteTime = getRouteDurationSeconds(a.route) ?? Infinity;
+  const bRouteTime = getRouteDurationSeconds(b.route) ?? Infinity;
+  const aDisplayedRouteMinutes = Math.round(aRouteTime / 60);
+  const bDisplayedRouteMinutes = Math.round(bRouteTime / 60);
+
+  if (aDisplayedRouteMinutes !== bDisplayedRouteMinutes) {
+    return aDisplayedRouteMinutes - bDisplayedRouteMinutes;
+  }
+
+  const aTomTomTime = a.assessment?.travelTimeSeconds ?? Infinity;
+  const bTomTomTime = b.assessment?.travelTimeSeconds ?? Infinity;
+  const tomTomEtaDelta = aTomTomTime - bTomTomTime;
+
+  if (tomTomEtaDelta !== 0) return tomTomEtaDelta;
+
+  const routeEtaDelta = aRouteTime - bRouteTime;
+
+  if (routeEtaDelta !== 0) return routeEtaDelta;
+
+  return (
+    (a.assessment?.delayRatio ?? Infinity) -
+    (b.assessment?.delayRatio ?? Infinity)
+  );
+}
+
+async function chooseRouteCandidate(
+  candidates: RouteCandidateInput[],
+  options: {
+    scoreAllCandidates: boolean;
+  }
+): Promise<{
   routeData: AppRoute;
   trafficAssessment: TrafficAssessment;
+  routeDecision: RouteDecisionReport;
 }> {
-  const routes = routeData.routes ?? [];
+  if (candidates.length === 0) {
+    const trafficAssessment = createUnavailableTrafficAssessment("No routes were available to score.", 1);
 
-  if (routes.length === 0) {
     return {
-      routeData,
-      trafficAssessment: createUnavailableTrafficAssessment("No routes were available to score.", 1),
+      routeData: { routes: [] },
+      trafficAssessment,
+      routeDecision: {
+        selectedCandidateId: null,
+        selectedReason: "No route candidates were available.",
+        candidateCount: 0,
+        scoredCandidateCount: 0,
+        candidates: [],
+      },
     };
   }
 
-  const scoredRoutes = [];
+  const orderedCandidates = [...candidates].sort((a, b) =>
+    compareCandidatesByRouteEta(a, b)
+  );
+  const scoredRoutes: {
+    route: Route;
+    assessment: TrafficAssessment;
+    candidate: RouteDecisionCandidate;
+    input: RouteCandidateInput;
+  }[] = [];
 
-  for (let index = 0; index < routes.length; index++) {
-    const assessment = await assessRouteWithTomTom(routes[index], index + 1);
-    scoredRoutes.push({ route: routes[index], assessment });
+  for (let index = 0; index < orderedCandidates.length; index++) {
+    const input = orderedCandidates[index];
+    const commercialValidation = validateCommercialRestrictions(input.route);
+    const commercialAccepted = commercialValidation.status !== "rejected";
+    const assessment = commercialAccepted
+      ? await assessRouteWithTomTom(input.route, index + 1)
+      : createCommercialRejectedTrafficAssessment(
+          commercialValidation.reason,
+          index + 1
+        );
+    const routeDurationSeconds = getRouteDurationSeconds(input.route);
+    const tomTomTravelTimeSeconds = assessment.travelTimeSeconds;
+    const trafficAccepted = assessment.status === "accepted";
+    const accepted = trafficAccepted && commercialAccepted;
+    const providerAttempt =
+      orderedCandidates
+        .slice(0, index + 1)
+        .filter((candidate) => candidate.provider === input.provider).length;
+    const candidate: RouteDecisionCandidate = {
+      id: `${input.provider}-${providerAttempt}`,
+      provider: input.provider,
+      label: input.label,
+      selected: false,
+      accepted,
+      rejectionReason: accepted
+        ? null
+        : [
+            commercialValidation.status === "rejected"
+              ? commercialValidation.reason
+              : null,
+            assessment.status !== "accepted" ? assessment.reason : null,
+          ]
+            .filter(Boolean)
+            .join(" "),
+      distanceMeters: getRouteDistanceMeters(input.route),
+      routeDurationSeconds,
+      tomTomTravelTimeSeconds,
+      tomTomDelaySeconds: assessment.delaySeconds,
+      tomTomDelayRatio: assessment.delayRatio,
+      commercialValidation,
+      trafficAssessment: assessment,
+    };
 
-    if (assessment.status === "accepted") {
+    scoredRoutes.push({ route: input.route, assessment, candidate, input });
+
+    if (accepted && !options.scoreAllCandidates) {
+      candidate.selected = true;
       return {
         routeData: {
-          ...routeData,
-          routes: [routes[index]],
+          routes: [input.route],
         },
         trafficAssessment: assessment,
+        routeDecision: {
+          selectedCandidateId: candidate.id,
+          selectedReason:
+            "Selected the fastest route ETA candidate that passed commercial validation and the TomTom traffic threshold.",
+          candidateCount: candidates.length,
+          scoredCandidateCount: scoredRoutes.length,
+          candidates: scoredRoutes.map((item) => item.candidate),
+        },
       };
     }
   }
 
-  const bestRoute =
-    scoredRoutes
-      .filter(({ assessment }) => assessment.delayRatio !== null)
-      .sort((a, b) => (a.assessment.delayRatio ?? Infinity) - (b.assessment.delayRatio ?? Infinity))[0] ??
-    scoredRoutes[0];
+  const acceptedRoutes = scoredRoutes.filter(
+    ({ candidate }) => candidate.accepted
+  );
+  const comparableRoutes = acceptedRoutes.length > 0 ? acceptedRoutes : scoredRoutes;
+  const bestRoute = [...comparableRoutes].sort(compareCandidatesByRouteEta)[0];
+
+  bestRoute.candidate.selected = true;
+
+  const selectedReason =
+    acceptedRoutes.length > 0
+      ? "Selected the commercial-valid route with the lowest displayed route ETA, using TomTom only when route ETA is tied."
+      : "No route passed both commercial validation and the traffic threshold, so the least-bad scored route was selected.";
 
   return {
     routeData: {
-      ...routeData,
       routes: [bestRoute.route],
     },
     trafficAssessment: bestRoute.assessment,
+    routeDecision: {
+      selectedCandidateId: bestRoute.candidate.id,
+      selectedReason,
+      candidateCount: candidates.length,
+      scoredCandidateCount: scoredRoutes.length,
+      candidates: scoredRoutes.map((item) => item.candidate),
+    },
   };
 }
 
@@ -434,6 +803,219 @@ function convertGeoapifyToAppRoute(geoapifyData: GeoapifyRouteResponse): AppRout
   };
 }
 
+function appendGeometry(target: Coordinate[], geometry: Coordinate[]) {
+  geometry.forEach((coordinate, index) => {
+    const previous = target[target.length - 1];
+
+    if (
+      index === 0 &&
+      previous &&
+      previous[0] === coordinate[0] &&
+      previous[1] === coordinate[1]
+    ) {
+      return;
+    }
+
+    target.push(coordinate);
+  });
+}
+
+function convertGoogleRoutesToAppRoute(googleData: GoogleRouteResponse): AppRoute {
+  const routes = googleData.routes ?? [];
+
+  return {
+    routes: routes.slice(0, GOOGLE_CANDIDATE_LIMIT).map((route) => {
+      const fallbackGeometry = route.polyline?.encodedPolyline
+        ? decodePolyline(route.polyline.encodedPolyline)
+        : [];
+      const fullGeometry: Coordinate[] = [];
+      const segments = (route.legs ?? []).map((leg) => {
+        const legGeometry: Coordinate[] = [];
+        const steps = (leg.steps ?? []).map((step) => {
+          const stepGeometry = step.polyline?.encodedPolyline
+            ? decodePolyline(step.polyline.encodedPolyline)
+            : [];
+          const startIndex = fullGeometry.length + legGeometry.length;
+
+          appendGeometry(legGeometry, stepGeometry);
+
+          return {
+            instruction: step.navigationInstruction?.instructions ?? "",
+            name: step.navigationInstruction?.instructions ?? "",
+            distance: step.distanceMeters ?? 0,
+            duration: parseDurationSeconds(step.staticDuration) ?? 0,
+            way_points: [
+              startIndex,
+              fullGeometry.length + Math.max(legGeometry.length - 1, 0),
+            ] as [number, number],
+          };
+        });
+
+        if (legGeometry.length === 0 && leg.polyline?.encodedPolyline) {
+          appendGeometry(legGeometry, decodePolyline(leg.polyline.encodedPolyline));
+        }
+
+        const segmentStartIndex = fullGeometry.length;
+        appendGeometry(fullGeometry, legGeometry);
+        const segmentEndIndex = Math.max(fullGeometry.length - 1, segmentStartIndex);
+
+        return {
+          distance: leg.distanceMeters ?? 0,
+          duration:
+            parseDurationSeconds(leg.duration) ??
+            parseDurationSeconds(leg.staticDuration) ??
+            0,
+          steps:
+            steps.length > 0
+              ? steps
+              : [
+                  {
+                    name: "",
+                    distance: leg.distanceMeters ?? 0,
+                    duration:
+                      parseDurationSeconds(leg.duration) ??
+                      parseDurationSeconds(leg.staticDuration) ??
+                      0,
+                    way_points: [segmentStartIndex, segmentEndIndex] as [number, number],
+                  },
+                ],
+        };
+      });
+
+      const geometry = fullGeometry.length > 0 ? fullGeometry : fallbackGeometry;
+      const durationSeconds =
+        parseDurationSeconds(route.duration) ??
+        parseDurationSeconds(route.staticDuration) ??
+        undefined;
+
+      return {
+        geometry,
+        segments,
+        distance: route.distanceMeters,
+        duration: durationSeconds,
+      };
+    }),
+  };
+}
+
+async function getGoogleRoute(coordinates: Coordinate[], language: AppLanguage) {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+
+  if (!apiKey) {
+    throw new Error("Missing GOOGLE_MAPS_API_KEY.");
+  }
+
+  if (coordinates.length < 2) {
+    throw new Error("Google routing requires an origin and destination.");
+  }
+
+  const [originLng, originLat] = coordinates[0];
+  const [destinationLng, destinationLat] = coordinates[coordinates.length - 1];
+  const intermediates = coordinates.slice(1, -1).map(([longitude, latitude]) => ({
+    location: {
+      latLng: {
+        latitude,
+        longitude,
+      },
+    },
+  }));
+
+  const response = await fetch(
+    "https://routes.googleapis.com/directions/v2:computeRoutes",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": apiKey,
+        "X-Goog-FieldMask":
+          "routes.duration,routes.staticDuration,routes.distanceMeters,routes.polyline.encodedPolyline,routes.legs.duration,routes.legs.staticDuration,routes.legs.distanceMeters,routes.legs.polyline.encodedPolyline,routes.legs.steps.distanceMeters,routes.legs.steps.staticDuration,routes.legs.steps.polyline.encodedPolyline,routes.legs.steps.navigationInstruction.instructions",
+      },
+      body: JSON.stringify({
+        origin: {
+          location: {
+            latLng: {
+              latitude: originLat,
+              longitude: originLng,
+            },
+          },
+        },
+        destination: {
+          location: {
+            latLng: {
+              latitude: destinationLat,
+              longitude: destinationLng,
+            },
+          },
+        },
+        ...(intermediates.length > 0 ? { intermediates } : {}),
+        travelMode: "DRIVE",
+        routingPreference: "TRAFFIC_AWARE",
+        computeAlternativeRoutes: intermediates.length === 0,
+        languageCode: language === "es" ? "es" : "en-US",
+        units: "IMPERIAL",
+      }),
+      cache: "no-store",
+    }
+  );
+
+  const data = (await response.json()) as GoogleRouteResponse;
+
+  if (!response.ok) {
+    throw new Error(
+      data.error?.message ||
+        data.error?.status ||
+        `Google routing failed with status ${response.status}`
+    );
+  }
+
+  return data;
+}
+
+function createRouteCandidates(
+  routeData: AppRoute,
+  provider: RouteDecisionCandidate["provider"],
+  limit: number
+): RouteCandidateInput[] {
+  return (routeData.routes ?? []).slice(0, limit).map((route, index) => ({
+    route,
+    provider,
+    label: `${provider.toUpperCase()} route ${index + 1}`,
+  }));
+}
+
+async function getOrsRoute(coordinates: Coordinate[], language: AppLanguage) {
+  const response = await fetch(
+    "https://api.heigit.org/openrouteservice/v2/directions/driving-hgv",
+    {
+      method: "POST",
+      headers: {
+        Authorization: process.env.OPENROUTESERVICE_API_KEY || "",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        coordinates,
+        language,
+        options: ORS_SMALL_TRUCK_OPTIONS,
+      }),
+      cache: "no-store",
+    }
+  );
+
+  let data: unknown = null;
+
+  try {
+    data = await response.json();
+  } catch {
+    throw new Error("OpenRouteService response was not valid JSON.");
+  }
+
+  if (!response.ok) {
+    throw new Error(`OpenRouteService failed with status ${response.status}`);
+  }
+
+  return data as AppRoute;
+}
+
 async function getGeoapifyRoute(coordinates: [number, number][]) {
   const waypoints = toGeoapifyWaypoints(coordinates);
 
@@ -546,6 +1128,8 @@ export async function POST(request: Request) {
       returnCoords,
       returnToStart = true,
       preserveOrder = false,
+      includeDecisionReport = false,
+      language: rawLanguage,
     } = body as {
       date: string;
       time: string;
@@ -556,7 +1140,10 @@ export async function POST(request: Request) {
       returnCoords?: unknown;
       returnToStart?: boolean;
       preserveOrder?: boolean;
+      includeDecisionReport?: boolean;
+      language?: unknown;
     };
+    const language = normalizeLanguage(rawLanguage);
 
     if (typeof start !== "string" || !start.trim()) {
       return jsonError("Start location is required.", 400);
@@ -689,6 +1276,9 @@ export async function POST(request: Request) {
 
     let routeData: AppRoute;
     let trafficAssessment: TrafficAssessment;
+    let routeDecision: RouteDecisionReport;
+    const isPointToPointRoute = !returnToStart && orsCoordinates.length === 2;
+    const shouldScoreAllCandidates = includeDecisionReport || isPointToPointRoute;
 
     if (USE_GEOAPIFY_ROUTING) {
       if (!process.env.GEOAPIFY_API_KEY) {
@@ -697,50 +1287,61 @@ export async function POST(request: Request) {
 
       const geoapifyData = await getGeoapifyRoute(orsCoordinates);
       routeData = convertGeoapifyToAppRoute(geoapifyData);
-      const selectedRoute = await chooseTrafficAwareRoute(routeData);
+      const selectedRoute = await chooseRouteCandidate(createRouteCandidates(routeData, "geoapify", 1), {
+        scoreAllCandidates: shouldScoreAllCandidates,
+      });
       routeData = selectedRoute.routeData;
       trafficAssessment = selectedRoute.trafficAssessment;
+      routeDecision = selectedRoute.routeDecision;
     } else {
       if (!process.env.OPENROUTESERVICE_API_KEY) {
         return jsonError("Missing OPENROUTESERVICE_API_KEY.", 500);
       }
 
-      const orsResponse = await fetch(
-        "https://api.heigit.org/openrouteservice/v2/directions/driving-hgv",
-        {
-          method: "POST",
-          headers: {
-            Authorization: process.env.OPENROUTESERVICE_API_KEY || "",
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            coordinates: orsCoordinates,
-            alternative_routes: {
-              target_count: 3,
-              weight_factor: 1.6,
-              share_factor: 0.6,
-            },
-          }),
-        }
-      );
+      const [googleResult, orsResult] = await Promise.allSettled([
+        isPointToPointRoute
+          ? getGoogleRoute(orsCoordinates, language).then(convertGoogleRoutesToAppRoute)
+          : Promise.resolve({ routes: [] } as AppRoute),
+        getOrsRoute(orsCoordinates, language),
+      ]);
 
-      console.log("ORS route status:", orsResponse.status);
+      const candidates: RouteCandidateInput[] = [];
+      const googleRouteData =
+        googleResult.status === "fulfilled" ? googleResult.value : null;
+      const orsRouteData = orsResult.status === "fulfilled" ? orsResult.value : null;
 
-      let orsData: unknown = null;
-
-      try {
-        orsData = await orsResponse.json();
-        console.log("ORS FULL RESPONSE:", JSON.stringify(orsData, null, 2));
-      } catch {
-        console.log("ORS response was not valid JSON");
+      if (googleRouteData) {
+        candidates.push(
+          ...createRouteCandidates(googleRouteData, "google", GOOGLE_CANDIDATE_LIMIT)
+        );
+      } else if (isPointToPointRoute && googleResult.status === "rejected") {
+        console.log("Google routing failed:", getErrorMessage(googleResult.reason));
       }
 
-      if (!orsResponse.ok) {
+      if (orsRouteData) {
+        candidates.push(...createRouteCandidates(orsRouteData, "ors", 1));
+      } else if (orsResult.status === "rejected") {
+        console.log("ORS routing failed:", getErrorMessage(orsResult.reason));
+      }
+
+      if (candidates.length === 0) {
         if (!process.env.GEOAPIFY_API_KEY) {
-          return jsonError("OpenRouteService failed and GEOAPIFY_API_KEY is missing.", 500);
+          const googleError =
+            googleResult.status === "rejected"
+              ? getErrorMessage(googleResult.reason)
+              : "Google returned no route candidates.";
+          const orsError =
+            orsResult.status === "rejected"
+              ? getErrorMessage(orsResult.reason)
+              : "OpenRouteService returned no route candidates.";
+
+          return jsonError(
+            `No route candidates were available. Google: ${googleError} ORS: ${orsError}`,
+            500
+          );
         }
 
-        console.log("ORS failed, falling back to Geoapify...");
+        console.log("Google/ORS failed, falling back to Geoapify...");
         const geoapifyData = await getGeoapifyRoute(orsCoordinates);
 
         console.log("GEOAPIFY FALLBACK SUMMARY:", {
@@ -751,10 +1352,12 @@ export async function POST(request: Request) {
         });
 
         const convertedRouteData = convertGeoapifyToAppRoute(geoapifyData);
-        routeData = convertedRouteData;
-        const selectedRoute = await chooseTrafficAwareRoute(routeData);
+        const selectedRoute = await chooseRouteCandidate(createRouteCandidates(convertedRouteData, "geoapify", 1), {
+          scoreAllCandidates: shouldScoreAllCandidates,
+        });
         routeData = selectedRoute.routeData;
         trafficAssessment = selectedRoute.trafficAssessment;
+        routeDecision = selectedRoute.routeDecision;
 
         console.log(
           "GEOAPIFY CONVERTED GEOMETRY LENGTH:",
@@ -775,10 +1378,12 @@ export async function POST(request: Request) {
           convertedRouteData.routes[0]?.segments?.[0]?.steps?.[0] || "no-step"
         );
       } else {
-        routeData = orsData as AppRoute;
-        const selectedRoute = await chooseTrafficAwareRoute(routeData);
+        const selectedRoute = await chooseRouteCandidate(candidates, {
+          scoreAllCandidates: shouldScoreAllCandidates,
+        });
         routeData = selectedRoute.routeData;
         trafficAssessment = selectedRoute.trafficAssessment;
+        routeDecision = selectedRoute.routeDecision;
       }
     }
 
@@ -787,6 +1392,7 @@ export async function POST(request: Request) {
       output: parsedOutput,
       orsRoute: routeData,
       trafficAssessment,
+      routeDecision,
     });
   } catch (error: unknown) {
     return NextResponse.json(
