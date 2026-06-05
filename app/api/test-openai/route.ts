@@ -6,6 +6,11 @@ import {
   chooseRouteCandidate as chooseValidatedRouteCandidate,
   createRouteCandidates as createValidatedRouteCandidates,
 } from "@/lib/routing-policy";
+import {
+  GEOAPIFY_TRUCK_MODE,
+  TOMTOM_TRUCK_QUERY_PARAMS,
+  TRAILER_FRIENDLY_ORS_OPTIONS,
+} from "@/lib/vehicle-profile";
 import type {
   AppRoute,
   Coordinate,
@@ -19,18 +24,32 @@ import { NURSERY_ADDRESS, normalizeAddress, startCoordsMap } from "@/lib/stops";
 
 const USE_GEOAPIFY_ROUTING = false;
 const GOOGLE_CANDIDATE_LIMIT = 2;
-const ORS_SMALL_TRUCK_OPTIONS = {
-  vehicle_type: "delivery",
-  profile_params: {
-    restrictions: {
-      height: 2.7,
-      width: 2.2,
-      length: 8,
-      weight: 5,
-      axleload: 3,
+const ORS_CANDIDATE_LIMIT = 2;
+const GEOAPIFY_FALLBACK_ROUTE_TYPE = "less_maneuvers";
+const NORTHBOUND_CORRIDOR_DESTINATION_LATITUDE = 40.55;
+const EASTERN_NORTHBOUND_CORRIDOR_MIN_LATITUDE = 40.6;
+const EASTERN_NORTHBOUND_CORRIDOR_MIN_LONGITUDE = -74.43;
+const EASTERN_NORTHBOUND_CORRIDOR_MAX_EXTRA_SECONDS = 25 * 60;
+const ROUTE_34_ROUTE_9_CORRIDOR_LABEL = "Route 34 / Route 9 / Route 1-82 corridor";
+
+const NORTHERN_CORRIDORS = [
+  {
+    id: "route-34-route-9",
+    label: ROUTE_34_ROUTE_9_CORRIDOR_LABEL,
+    waypoints: [[-74.248, 40.6895]] as Coordinate[],
+    routeModifiers: {
+      avoidHighways: true,
     },
   },
-};
+];
+
+function isEasternNorthboundDestination(destination: Coordinate | undefined) {
+  return (
+    !!destination &&
+    destination[1] >= EASTERN_NORTHBOUND_CORRIDOR_MIN_LATITUDE &&
+    destination[0] >= EASTERN_NORTHBOUND_CORRIDOR_MIN_LONGITUDE
+  );
+}
 
 function getOpenAIClient() {
   const apiKey = process.env.OPENAI_API_KEY;
@@ -124,6 +143,49 @@ type GoogleRouteResponse = {
   };
 };
 
+type GoogleRouteModifiers = {
+  avoidTolls?: boolean;
+  avoidHighways?: boolean;
+};
+
+type TomTomPoint = {
+  latitude: number;
+  longitude: number;
+};
+
+type TomTomGuidanceInstruction = {
+  message?: string;
+  routeOffsetInMeters?: number;
+  travelTimeInSeconds?: number;
+  point?: TomTomPoint;
+  pointIndex?: number;
+};
+
+type TomTomRoute = {
+  summary?: {
+    lengthInMeters?: number;
+    travelTimeInSeconds?: number;
+  };
+  legs?: {
+    summary?: {
+      lengthInMeters?: number;
+      travelTimeInSeconds?: number;
+    };
+    points?: TomTomPoint[];
+  }[];
+  guidance?: {
+    instructions?: TomTomGuidanceInstruction[];
+  };
+};
+
+type TomTomRouteResponse = {
+  routes?: TomTomRoute[];
+  detailedError?: {
+    message?: string;
+  };
+  error?: string;
+};
+
 type RouteCandidateInput = {
   route: Route;
   provider: RouteDecisionCandidate["provider"];
@@ -140,6 +202,31 @@ function toGeoapifyWaypoints(coordinates: [number, number][]) {
 
 function jsonError(message: string, status: number) {
   return NextResponse.json({ success: false, error: message }, { status });
+}
+
+function getNorthernCorridorsForRoute(coordinates: Coordinate[]) {
+  const destination = coordinates[coordinates.length - 1];
+
+  if (!destination || destination[1] < NORTHBOUND_CORRIDOR_DESTINATION_LATITUDE) {
+    return [];
+  }
+
+  return NORTHERN_CORRIDORS;
+}
+
+function getSelectionPreferenceForRoute(coordinates: Coordinate[]) {
+  const destination = coordinates[coordinates.length - 1];
+
+  if (isEasternNorthboundDestination(destination)) {
+    return {
+      labelIncludes: [ROUTE_34_ROUTE_9_CORRIDOR_LABEL],
+      maxExtraSeconds: EASTERN_NORTHBOUND_CORRIDOR_MAX_EXTRA_SECONDS,
+      reason:
+        "Selected the Route 34 / Route 9 / Route 1-82 corridor because this eastern northbound destination is in the Short Hills/Summit/Springfield corridor zone and the route was commercially valid within the allowed ETA tolerance.",
+    };
+  }
+
+  return undefined;
 }
 
 function parseDurationSeconds(value: string | undefined): number | null {
@@ -233,66 +320,65 @@ function getCanonicalRouteOrder(
 }
 
 function convertGeoapifyToAppRoute(geoapifyData: GeoapifyRouteResponse): AppRoute {
-  const feature = geoapifyData?.features?.[0];
+  const features = geoapifyData?.features ?? [];
 
-  if (!feature) {
+  if (features.length === 0) {
     throw new Error("Geoapify route response did not include any features.");
   }
 
-  const legLines = feature.geometry?.coordinates || [];
-  const properties = feature.properties || {};
-  const legs = properties.legs || [];
-
-  const flatGeometry: Coordinate[] = legLines.flat();
-
-  let geometryOffset = 0;
-
-  const segments = legs.map((leg, legIndex) => {
-    const legGeometry = legLines[legIndex] || [];
-    const legLength = legGeometry.length;
-
-    const steps = (leg.steps || []).map((step) => ({
-      name: step.instruction?.text || "",
-      distance: step.distance ?? 0,
-      duration: step.time ?? 0,
-      way_points: [
-        geometryOffset + (step.from_index ?? 0),
-        geometryOffset + (step.to_index ?? 0),
-      ] as [number, number],
-    }));
-
-    const segment = {
-      distance: leg.distance ?? 0,
-      duration: leg.time ?? 0,
-      steps:
-        steps.length > 0
-          ? steps
-          : [
-              {
-                name: "",
-                distance: leg.distance ?? 0,
-                duration: leg.time ?? 0,
-                way_points: [
-                  geometryOffset,
-                  geometryOffset + Math.max(legLength - 1, 0),
-                ] as [number, number],
-              },
-            ],
-    };
-
-    geometryOffset += legLength;
-    return segment;
-  });
-
   return {
-    routes: [
-      {
+    routes: features.map((feature) => {
+      const legLines = feature.geometry?.coordinates || [];
+      const properties = feature.properties || {};
+      const legs = properties.legs || [];
+      const flatGeometry: Coordinate[] = legLines.flat();
+
+      let geometryOffset = 0;
+
+      const segments = legs.map((leg, legIndex) => {
+        const legGeometry = legLines[legIndex] || [];
+        const legLength = legGeometry.length;
+
+        const steps = (leg.steps || []).map((step) => ({
+          name: step.instruction?.text || "",
+          distance: step.distance ?? 0,
+          duration: step.time ?? 0,
+          way_points: [
+            geometryOffset + (step.from_index ?? 0),
+            geometryOffset + (step.to_index ?? 0),
+          ] as [number, number],
+        }));
+
+        const segment = {
+          distance: leg.distance ?? 0,
+          duration: leg.time ?? 0,
+          steps:
+            steps.length > 0
+              ? steps
+              : [
+                  {
+                    name: "",
+                    distance: leg.distance ?? 0,
+                    duration: leg.time ?? 0,
+                    way_points: [
+                      geometryOffset,
+                      geometryOffset + Math.max(legLength - 1, 0),
+                    ] as [number, number],
+                  },
+                ],
+        };
+
+        geometryOffset += legLength;
+        return segment;
+      });
+
+      return {
         geometry: flatGeometry,
         segments,
         distance: properties.distance,
         time: properties.time,
-      },
-    ],
+      };
+    }),
   };
 }
 
@@ -391,7 +477,126 @@ function convertGoogleRoutesToAppRoute(googleData: GoogleRouteResponse): AppRout
   };
 }
 
-async function getGoogleRoute(coordinates: Coordinate[], language: AppLanguage) {
+function getClosestGeometryIndex(point: Coordinate, geometry: Coordinate[]) {
+  if (geometry.length === 0) return 0;
+
+  let closestIndex = 0;
+  let closestDistance = Infinity;
+
+  for (let index = 0; index < geometry.length; index++) {
+    const [longitude, latitude] = geometry[index];
+    const distance =
+      Math.abs(longitude - point[0]) + Math.abs(latitude - point[1]);
+
+    if (distance < closestDistance) {
+      closestDistance = distance;
+      closestIndex = index;
+    }
+  }
+
+  return closestIndex;
+}
+
+function convertTomTomRoutesToAppRoute(tomTomData: TomTomRouteResponse): AppRoute {
+  return {
+    routes: (tomTomData.routes ?? []).slice(0, 1).map((route) => {
+      const geometry: Coordinate[] = [];
+      const segments = (route.legs ?? []).map((leg) => {
+        const segmentStartIndex = geometry.length;
+        const legGeometry = (leg.points ?? []).map(
+          (point) => [point.longitude, point.latitude] as Coordinate
+        );
+
+        appendGeometry(geometry, legGeometry);
+
+        return {
+          distance: leg.summary?.lengthInMeters ?? route.summary?.lengthInMeters ?? 0,
+          duration:
+            leg.summary?.travelTimeInSeconds ??
+            route.summary?.travelTimeInSeconds ??
+            0,
+          steps: [
+            {
+              name: "",
+              distance:
+                leg.summary?.lengthInMeters ?? route.summary?.lengthInMeters ?? 0,
+              duration:
+                leg.summary?.travelTimeInSeconds ??
+                route.summary?.travelTimeInSeconds ??
+                0,
+              way_points: [
+                segmentStartIndex,
+                Math.max(geometry.length - 1, segmentStartIndex),
+              ] as [number, number],
+            },
+          ],
+        };
+      });
+
+      const instructionSteps = (route.guidance?.instructions ?? [])
+        .map((instruction, index, instructions) => {
+          const pointIndex =
+            typeof instruction.pointIndex === "number"
+              ? instruction.pointIndex
+              : instruction.point
+                ? getClosestGeometryIndex(
+                    [instruction.point.longitude, instruction.point.latitude],
+                    geometry
+                  )
+                : 0;
+          const nextInstruction = instructions[index + 1];
+          const nextPointIndex =
+            typeof nextInstruction?.pointIndex === "number"
+              ? nextInstruction.pointIndex
+              : nextInstruction?.point
+                ? getClosestGeometryIndex(
+                    [nextInstruction.point.longitude, nextInstruction.point.latitude],
+                    geometry
+                  )
+                : geometry.length - 1;
+
+          return {
+            instruction: instruction.message ?? "",
+            name: instruction.message ?? "",
+            distance: instruction.routeOffsetInMeters ?? 0,
+            duration: instruction.travelTimeInSeconds ?? 0,
+            way_points: [
+              Math.max(0, Math.min(pointIndex, geometry.length - 1)),
+              Math.max(0, Math.min(nextPointIndex, geometry.length - 1)),
+            ] as [number, number],
+          };
+        })
+        .filter((step) => step.name || step.instruction);
+
+      if (instructionSteps.length > 0) {
+        segments[0] = {
+          ...(segments[0] ?? {
+            distance: route.summary?.lengthInMeters ?? 0,
+            duration: route.summary?.travelTimeInSeconds ?? 0,
+          }),
+          steps: instructionSteps,
+        };
+      }
+
+      return {
+        geometry,
+        segments,
+        distance: route.summary?.lengthInMeters,
+        duration: route.summary?.travelTimeInSeconds,
+      };
+    }),
+  };
+}
+
+async function getGoogleRoute(
+  coordinates: Coordinate[],
+  language: AppLanguage,
+  options: {
+    routeModifiers?: GoogleRouteModifiers;
+    computeAlternativeRoutes?: boolean;
+    corridorWaypoints?: Coordinate[];
+  } = {}
+) {
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
 
   if (!apiKey) {
@@ -404,7 +609,7 @@ async function getGoogleRoute(coordinates: Coordinate[], language: AppLanguage) 
 
   const [originLng, originLat] = coordinates[0];
   const [destinationLng, destinationLat] = coordinates[coordinates.length - 1];
-  const intermediates = coordinates.slice(1, -1).map(([longitude, latitude]) => ({
+  const stopIntermediates = coordinates.slice(1, -1).map(([longitude, latitude]) => ({
     location: {
       latLng: {
         latitude,
@@ -412,6 +617,18 @@ async function getGoogleRoute(coordinates: Coordinate[], language: AppLanguage) 
       },
     },
   }));
+  const corridorIntermediates = (options.corridorWaypoints ?? []).map(
+    ([longitude, latitude]) => ({
+      location: {
+        latLng: {
+          latitude,
+          longitude,
+        },
+      },
+      via: true,
+    })
+  );
+  const intermediates = [...stopIntermediates, ...corridorIntermediates];
 
   const response = await fetch(
     "https://routes.googleapis.com/directions/v2:computeRoutes",
@@ -443,7 +660,9 @@ async function getGoogleRoute(coordinates: Coordinate[], language: AppLanguage) 
         ...(intermediates.length > 0 ? { intermediates } : {}),
         travelMode: "DRIVE",
         routingPreference: "TRAFFIC_AWARE",
-        computeAlternativeRoutes: intermediates.length === 0,
+        computeAlternativeRoutes:
+          options.computeAlternativeRoutes ?? intermediates.length === 0,
+        ...(options.routeModifiers ? { routeModifiers: options.routeModifiers } : {}),
         languageCode: language === "es" ? "es" : "en-US",
         units: "IMPERIAL",
       }),
@@ -464,7 +683,55 @@ async function getGoogleRoute(coordinates: Coordinate[], language: AppLanguage) 
   return data;
 }
 
-async function getOrsRoute(coordinates: Coordinate[], language: AppLanguage) {
+async function getTomTomRoute(coordinates: Coordinate[], language: AppLanguage) {
+  const apiKey = process.env.TOMTOM_API_KEY;
+
+  if (!apiKey) {
+    throw new Error("Missing TOMTOM_API_KEY.");
+  }
+
+  if (coordinates.length < 2) {
+    throw new Error("TomTom routing requires an origin and destination.");
+  }
+
+  const locations = coordinates
+    .map(([longitude, latitude]) => `${latitude},${longitude}`)
+    .join(":");
+  const query = new URLSearchParams({
+    key: apiKey,
+    traffic: "true",
+    routeRepresentation: "polyline",
+    computeTravelTimeFor: "all",
+    instructionsType: "text",
+    language: language === "es" ? "es-MX" : "en-US",
+    ...TOMTOM_TRUCK_QUERY_PARAMS,
+  });
+
+  const response = await fetch(
+    `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json?${query}`,
+    {
+      method: "GET",
+      cache: "no-store",
+    }
+  );
+  const data = (await response.json()) as TomTomRouteResponse;
+
+  if (!response.ok) {
+    throw new Error(
+      data.detailedError?.message ||
+        data.error ||
+        `TomTom routing failed with status ${response.status}`
+    );
+  }
+
+  return data;
+}
+
+async function getOrsRoute(
+  coordinates: Coordinate[],
+  language: AppLanguage,
+  candidateLimit: number
+) {
   const response = await fetch(
     "https://api.heigit.org/openrouteservice/v2/directions/driving-hgv",
     {
@@ -476,7 +743,16 @@ async function getOrsRoute(coordinates: Coordinate[], language: AppLanguage) {
       body: JSON.stringify({
         coordinates,
         language,
-        options: ORS_SMALL_TRUCK_OPTIONS,
+        options: TRAILER_FRIENDLY_ORS_OPTIONS,
+        ...(candidateLimit > 1
+          ? {
+              alternative_routes: {
+                target_count: candidateLimit,
+                share_factor: 0.6,
+                weight_factor: 1.4,
+              },
+            }
+          : {}),
       }),
       cache: "no-store",
     }
@@ -497,14 +773,19 @@ async function getOrsRoute(coordinates: Coordinate[], language: AppLanguage) {
   return data as AppRoute;
 }
 
-async function getGeoapifyRoute(coordinates: [number, number][]) {
+async function getGeoapifyRoute(
+  coordinates: [number, number][],
+  routeType = GEOAPIFY_FALLBACK_ROUTE_TYPE
+) {
   const waypoints = toGeoapifyWaypoints(coordinates);
 
   const url =
     `https://api.geoapify.com/v1/routing` +
     `?waypoints=${encodeURIComponent(waypoints)}` +
-    `&mode=truck` +
+    `&mode=${GEOAPIFY_TRUCK_MODE}` +
+    `&type=${routeType}` +
     `&details=instruction_details` +
+    `&traffic=approximated` +
     `&apiKey=${process.env.GEOAPIFY_API_KEY}`;
 
   const response = await fetch(url, {
@@ -766,7 +1047,10 @@ export async function POST(request: Request) {
         return jsonError("Missing GEOAPIFY_API_KEY.", 500);
       }
 
-      const geoapifyData = await getGeoapifyRoute(orsCoordinates);
+      const geoapifyData = await getGeoapifyRoute(
+        orsCoordinates,
+        GEOAPIFY_FALLBACK_ROUTE_TYPE
+      );
       routeData = convertGeoapifyToAppRoute(geoapifyData);
       const selectedRoute = await chooseValidatedRouteCandidate(createValidatedRouteCandidates(routeData, "geoapify", 1), {
         scoreAllCandidates: shouldScoreAllCandidates,
@@ -775,92 +1059,142 @@ export async function POST(request: Request) {
       trafficAssessment = selectedRoute.trafficAssessment;
       routeDecision = selectedRoute.routeDecision;
     } else {
-      if (!process.env.OPENROUTESERVICE_API_KEY) {
-        return jsonError("Missing OPENROUTESERVICE_API_KEY.", 500);
+      if (
+        !process.env.GOOGLE_MAPS_API_KEY &&
+        !process.env.GEOAPIFY_API_KEY &&
+        !process.env.OPENROUTESERVICE_API_KEY &&
+        !process.env.TOMTOM_API_KEY
+      ) {
+        return jsonError("Missing routing API keys.", 500);
       }
 
-      const [googleResult, orsResult] = await Promise.allSettled([
-        isPointToPointRoute
+      const northernCorridors = isPointToPointRoute
+        ? getNorthernCorridorsForRoute(orsCoordinates)
+        : [];
+      const corridorResults = await Promise.allSettled(
+        northernCorridors.map((corridor) =>
+          process.env.GOOGLE_MAPS_API_KEY
+            ? getGoogleRoute(orsCoordinates, language, {
+                corridorWaypoints: corridor.waypoints,
+                routeModifiers: corridor.routeModifiers,
+                computeAlternativeRoutes: false,
+              })
+                .then(convertGoogleRoutesToAppRoute)
+                .then((routeData) => ({ corridor, routeData }))
+            : Promise.resolve({ corridor, routeData: { routes: [] } as AppRoute })
+        )
+      );
+      const [googleResult, orsResult, tomTomResult] = await Promise.allSettled([
+        process.env.GOOGLE_MAPS_API_KEY
           ? getGoogleRoute(orsCoordinates, language).then(convertGoogleRoutesToAppRoute)
           : Promise.resolve({ routes: [] } as AppRoute),
-        getOrsRoute(orsCoordinates, language),
+        process.env.OPENROUTESERVICE_API_KEY
+          ? getOrsRoute(
+              orsCoordinates,
+              language,
+              isPointToPointRoute ? ORS_CANDIDATE_LIMIT : 1
+            )
+          : Promise.resolve({ routes: [] } as AppRoute),
+        process.env.TOMTOM_API_KEY
+          ? getTomTomRoute(orsCoordinates, language).then(convertTomTomRoutesToAppRoute)
+          : Promise.resolve({ routes: [] } as AppRoute),
       ]);
 
       const candidates: RouteCandidateInput[] = [];
       const googleRouteData =
         googleResult.status === "fulfilled" ? googleResult.value : null;
       const orsRouteData = orsResult.status === "fulfilled" ? orsResult.value : null;
+      const tomTomRouteData =
+        tomTomResult.status === "fulfilled" ? tomTomResult.value : null;
 
       if (googleRouteData) {
         candidates.push(
-          ...createValidatedRouteCandidates(googleRouteData, "google", GOOGLE_CANDIDATE_LIMIT)
+          ...createValidatedRouteCandidates(
+            googleRouteData,
+            "google",
+            isPointToPointRoute ? GOOGLE_CANDIDATE_LIMIT : 1
+          )
         );
-      } else if (isPointToPointRoute && googleResult.status === "rejected") {
+      } else if (googleResult.status === "rejected") {
         console.log("Google routing failed:", getErrorMessage(googleResult.reason));
       }
 
+      corridorResults.forEach((result) => {
+        if (result.status === "fulfilled") {
+          candidates.push(
+            ...createValidatedRouteCandidates(result.value.routeData, "google", 1).map(
+              (candidate) => ({
+                ...candidate,
+                label: `Google ${result.value.corridor.label}`,
+              })
+            )
+          );
+          return;
+        }
+
+        console.log("Google northern corridor routing failed:", getErrorMessage(result.reason));
+      });
+
       if (orsRouteData) {
-        candidates.push(...createValidatedRouteCandidates(orsRouteData, "ors", 1));
+        candidates.push(
+          ...createValidatedRouteCandidates(
+            orsRouteData,
+            "ors",
+            isPointToPointRoute ? ORS_CANDIDATE_LIMIT : 1
+          )
+        );
       } else if (orsResult.status === "rejected") {
         console.log("ORS routing failed:", getErrorMessage(orsResult.reason));
       }
 
-      if (candidates.length === 0) {
-        if (!process.env.GEOAPIFY_API_KEY) {
-          const googleError =
-            googleResult.status === "rejected"
-              ? getErrorMessage(googleResult.reason)
-              : "Google returned no route candidates.";
-          const orsError =
-            orsResult.status === "rejected"
-              ? getErrorMessage(orsResult.reason)
-              : "OpenRouteService returned no route candidates.";
+      if (tomTomRouteData) {
+        candidates.push(...createValidatedRouteCandidates(tomTomRouteData, "tomtom", 1));
+      } else if (tomTomResult.status === "rejected") {
+        console.log("TomTom routing failed:", getErrorMessage(tomTomResult.reason));
+      }
 
+      if (candidates.length === 0) {
+        const googleError =
+          googleResult.status === "rejected"
+            ? getErrorMessage(googleResult.reason)
+            : "Google returned no route candidates.";
+        const orsError =
+          orsResult.status === "rejected"
+            ? getErrorMessage(orsResult.reason)
+            : "OpenRouteService returned no route candidates.";
+        const tomTomError =
+          tomTomResult.status === "rejected"
+            ? getErrorMessage(tomTomResult.reason)
+            : "TomTom returned no route candidates.";
+
+        if (!process.env.GEOAPIFY_API_KEY) {
           return jsonError(
-            `No route candidates were available. Google: ${googleError} ORS: ${orsError}`,
+            `No route candidates were available. Google: ${googleError} ORS: ${orsError} TomTom: ${tomTomError}`,
             500
           );
         }
 
-        console.log("Google/ORS failed, falling back to Geoapify...");
-        const geoapifyData = await getGeoapifyRoute(orsCoordinates);
-
-        console.log("GEOAPIFY FALLBACK SUMMARY:", {
-          featureCount: geoapifyData?.features?.length ?? 0,
-          legCount: geoapifyData?.features?.[0]?.properties?.legs?.length ?? 0,
-          distance: geoapifyData?.features?.[0]?.properties?.distance ?? null,
-          time: geoapifyData?.features?.[0]?.properties?.time ?? null,
-        });
-
+        console.log("Google/ORS/TomTom failed, falling back to Geoapify...");
+        const geoapifyData = await getGeoapifyRoute(
+          orsCoordinates,
+          GEOAPIFY_FALLBACK_ROUTE_TYPE
+        );
         const convertedRouteData = convertGeoapifyToAppRoute(geoapifyData);
-        const selectedRoute = await chooseValidatedRouteCandidate(createValidatedRouteCandidates(convertedRouteData, "geoapify", 1), {
-          scoreAllCandidates: shouldScoreAllCandidates,
-        });
+        const selectedRoute = await chooseValidatedRouteCandidate(
+          createValidatedRouteCandidates(convertedRouteData, "geoapify", 1),
+          {
+            scoreAllCandidates: shouldScoreAllCandidates,
+          }
+        );
         routeData = selectedRoute.routeData;
         trafficAssessment = selectedRoute.trafficAssessment;
         routeDecision = selectedRoute.routeDecision;
-
-        console.log(
-          "GEOAPIFY CONVERTED GEOMETRY LENGTH:",
-          Array.isArray(convertedRouteData.routes[0]?.geometry)
-            ? convertedRouteData.routes[0].geometry.length
-            : "not-array"
-        );
-
-        console.log(
-          "GEOAPIFY CONVERTED SEGMENTS LENGTH:",
-          Array.isArray(convertedRouteData.routes[0]?.segments)
-            ? convertedRouteData.routes[0].segments.length
-            : "no-segments"
-        );
-
-        console.log(
-          "GEOAPIFY FIRST SEGMENT FIRST STEP:",
-          convertedRouteData.routes[0]?.segments?.[0]?.steps?.[0] || "no-step"
-        );
       } else {
         const selectedRoute = await chooseValidatedRouteCandidate(candidates, {
           scoreAllCandidates: shouldScoreAllCandidates,
+          selectionPreference: isPointToPointRoute
+            ? getSelectionPreferenceForRoute(orsCoordinates)
+            : undefined,
         });
         routeData = selectedRoute.routeData;
         trafficAssessment = selectedRoute.trafficAssessment;

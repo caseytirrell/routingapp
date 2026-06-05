@@ -84,7 +84,7 @@ export type CommercialRestrictionValidation = {
 
 export type RouteDecisionCandidate = {
   id: string;
-  provider: "ors" | "geoapify" | "google";
+  provider: "ors" | "geoapify" | "google" | "tomtom";
   label: string;
   selected: boolean;
   accepted: boolean;

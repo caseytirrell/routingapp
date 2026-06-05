@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { TRAILER_FRIENDLY_ORS_OPTIONS } from "@/lib/vehicle-profile";
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown error";
@@ -30,7 +31,8 @@ export async function GET() {
             [-74.061588, 40.230499],
             [-74.042879, 40.102352],
             [-74.177646, 40.304492]
-          ]
+          ],
+          options: TRAILER_FRIENDLY_ORS_OPTIONS,
         }),
       }
     );

@@ -1,4 +1,5 @@
 import { decodePolyline } from "./geo";
+import { TOMTOM_TRUCK_QUERY_PARAMS } from "./vehicle-profile";
 import type {
   AppRoute,
   CommercialRestrictionValidation,
@@ -247,11 +248,16 @@ async function assessRouteWithTomTom(
   const origin = geometry[0];
   const destination = geometry[geometry.length - 1];
   const locations = `${origin[1]},${origin[0]}:${destination[1]},${destination[0]}`;
+  const query = new URLSearchParams({
+    key: apiKey,
+    traffic: "true",
+    routeRepresentation: "summaryOnly",
+    computeTravelTimeFor: "all",
+    sectionType: "traffic",
+    ...TOMTOM_TRUCK_QUERY_PARAMS,
+  });
   const response = await fetch(
-    `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
-      `?key=${encodeURIComponent(apiKey)}` +
-      `&traffic=true&travelMode=truck&routeRepresentation=summaryOnly` +
-      `&computeTravelTimeFor=all&sectionType=traffic`,
+    `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json?${query}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -337,16 +343,14 @@ function compareCandidatesByRouteEta(
 ) {
   const aRouteTime = getRouteDurationSeconds(a.route) ?? Infinity;
   const bRouteTime = getRouteDurationSeconds(b.route) ?? Infinity;
-  const roundedEtaDelta = Math.round(aRouteTime / 60) - Math.round(bRouteTime / 60);
 
-  if (roundedEtaDelta !== 0) return roundedEtaDelta;
+  if (aRouteTime !== bRouteTime) return aRouteTime - bRouteTime;
 
   const tomTomEtaDelta =
     (a.assessment?.travelTimeSeconds ?? Infinity) -
     (b.assessment?.travelTimeSeconds ?? Infinity);
 
   if (tomTomEtaDelta !== 0) return tomTomEtaDelta;
-  if (aRouteTime !== bRouteTime) return aRouteTime - bRouteTime;
 
   return (a.assessment?.delayRatio ?? Infinity) - (b.assessment?.delayRatio ?? Infinity);
 }
@@ -365,7 +369,14 @@ export function createRouteCandidates(
 
 export async function chooseRouteCandidate(
   candidates: RouteCandidateInput[],
-  options: { scoreAllCandidates: boolean }
+  options: {
+    scoreAllCandidates: boolean;
+    selectionPreference?: {
+      labelIncludes: string[];
+      maxExtraSeconds: number;
+      reason: string;
+    };
+  }
 ): Promise<{
   routeData: AppRoute;
   trafficAssessment: TrafficAssessment;
@@ -385,7 +396,7 @@ export async function chooseRouteCandidate(
     const assessment = commercialAccepted
       ? await assessRouteWithTomTom(input.route, index + 1)
       : createCommercialRejectedTrafficAssessment(commercialValidation.reason, index + 1);
-    const accepted = assessment.status === "accepted" && commercialAccepted;
+    const accepted = commercialAccepted;
     const providerAttempt =
       orderedCandidates
         .slice(0, index + 1)
@@ -402,7 +413,9 @@ export async function chooseRouteCandidate(
             commercialValidation.status === "rejected"
               ? commercialValidation.reason
               : null,
-            assessment.status !== "accepted" ? assessment.reason : null,
+            !commercialAccepted && assessment.status !== "accepted"
+              ? assessment.reason
+              : null,
           ]
             .filter(Boolean)
             .join(" "),
@@ -417,7 +430,11 @@ export async function chooseRouteCandidate(
 
     scoredRoutes.push({ route: input.route, assessment, candidate });
 
-    if (accepted && !options.scoreAllCandidates) {
+    if (
+      commercialAccepted &&
+      !options.scoreAllCandidates &&
+      !options.selectionPreference
+    ) {
       candidate.selected = true;
       return {
         routeData: { routes: [input.route] },
@@ -425,7 +442,7 @@ export async function chooseRouteCandidate(
         routeDecision: {
           selectedCandidateId: candidate.id,
           selectedReason:
-            "Selected the fastest route ETA candidate that passed commercial validation and the TomTom traffic threshold.",
+            "Selected the fastest route ETA candidate that passed commercial validation. TomTom traffic was checked and included in the decision report.",
           candidateCount: candidates.length,
           scoredCandidateCount: scoredRoutes.length,
           candidates: scoredRoutes.map((item) => item.candidate),
@@ -444,11 +461,29 @@ export async function chooseRouteCandidate(
     );
   }
 
-  const acceptedRoutes = commerciallyValidRoutes.filter(({ candidate }) => candidate.accepted);
-  const bestRoute = [...(acceptedRoutes.length > 0 ? acceptedRoutes : commerciallyValidRoutes)]
-    .sort(compareCandidatesByRouteEta)[0];
+  const fastestRoute = [...commerciallyValidRoutes].sort(compareCandidatesByRouteEta)[0];
+  const preferredRoute = options.selectionPreference
+    ? [...commerciallyValidRoutes]
+        .filter(({ candidate }) =>
+          options.selectionPreference?.labelIncludes.some((label) =>
+            candidate.label.includes(label)
+          )
+        )
+        .sort(compareCandidatesByRouteEta)[0]
+    : undefined;
+  const fastestRouteSeconds = getRouteDurationSeconds(fastestRoute.route) ?? Infinity;
+  const preferredRouteSeconds = preferredRoute
+    ? getRouteDurationSeconds(preferredRoute.route) ?? Infinity
+    : Infinity;
+  const bestRoute =
+    preferredRoute &&
+    preferredRouteSeconds <=
+      fastestRouteSeconds + (options.selectionPreference?.maxExtraSeconds ?? 0)
+      ? preferredRoute
+      : fastestRoute;
 
   bestRoute.candidate.selected = true;
+  const usedPreference = bestRoute === preferredRoute;
 
   return {
     routeData: { routes: [bestRoute.route] },
@@ -456,9 +491,9 @@ export async function chooseRouteCandidate(
     routeDecision: {
       selectedCandidateId: bestRoute.candidate.id,
       selectedReason:
-        acceptedRoutes.length > 0
-          ? "Selected the commercial-valid route with the lowest displayed route ETA, using TomTom only when route ETA is tied."
-          : "No commercially valid route passed the traffic threshold, so the lowest-ETA commercially valid fallback was selected.",
+        usedPreference && options.selectionPreference
+          ? options.selectionPreference.reason
+          : "Selected the commercially valid route with the lowest displayed route ETA, using TomTom traffic only when route ETA is tied.",
       candidateCount: candidates.length,
       scoredCandidateCount: scoredRoutes.length,
       candidates: scoredRoutes.map((item) => item.candidate),
