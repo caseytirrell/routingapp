@@ -2,6 +2,7 @@ import OpenAI from "openai";
 import { NextResponse } from "next/server";
 import { decodePolyline } from "@/lib/geo";
 import { normalizeLanguage, type AppLanguage } from "@/lib/i18n";
+import { withProviderTimeout } from "@/lib/provider-timeouts";
 import {
   chooseRouteCandidate as chooseValidatedRouteCandidate,
   createRouteCandidates as createValidatedRouteCandidates,
@@ -630,47 +631,51 @@ async function getGoogleRoute(
   );
   const intermediates = [...stopIntermediates, ...corridorIntermediates];
 
-  const response = await fetch(
-    "https://routes.googleapis.com/directions/v2:computeRoutes",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": apiKey,
-        "X-Goog-FieldMask":
-          "routes.duration,routes.staticDuration,routes.distanceMeters,routes.polyline.encodedPolyline,routes.legs.duration,routes.legs.staticDuration,routes.legs.distanceMeters,routes.legs.polyline.encodedPolyline,routes.legs.steps.distanceMeters,routes.legs.steps.staticDuration,routes.legs.steps.polyline.encodedPolyline,routes.legs.steps.navigationInstruction.instructions",
-      },
-      body: JSON.stringify({
-        origin: {
-          location: {
-            latLng: {
-              latitude: originLat,
-              longitude: originLng,
+  const { response, data } = await withProviderTimeout("google", async (signal) => {
+    const response = await fetch(
+      "https://routes.googleapis.com/directions/v2:computeRoutes",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Goog-Api-Key": apiKey,
+          "X-Goog-FieldMask":
+            "routes.duration,routes.staticDuration,routes.distanceMeters,routes.polyline.encodedPolyline,routes.legs.duration,routes.legs.staticDuration,routes.legs.distanceMeters,routes.legs.polyline.encodedPolyline,routes.legs.steps.distanceMeters,routes.legs.steps.staticDuration,routes.legs.steps.polyline.encodedPolyline,routes.legs.steps.navigationInstruction.instructions",
+        },
+        body: JSON.stringify({
+          origin: {
+            location: {
+              latLng: {
+                latitude: originLat,
+                longitude: originLng,
+              },
             },
           },
-        },
-        destination: {
-          location: {
-            latLng: {
-              latitude: destinationLat,
-              longitude: destinationLng,
+          destination: {
+            location: {
+              latLng: {
+                latitude: destinationLat,
+                longitude: destinationLng,
+              },
             },
           },
-        },
-        ...(intermediates.length > 0 ? { intermediates } : {}),
-        travelMode: "DRIVE",
-        routingPreference: "TRAFFIC_AWARE",
-        computeAlternativeRoutes:
-          options.computeAlternativeRoutes ?? intermediates.length === 0,
-        ...(options.routeModifiers ? { routeModifiers: options.routeModifiers } : {}),
-        languageCode: language === "es" ? "es" : "en-US",
-        units: "IMPERIAL",
-      }),
-      cache: "no-store",
-    }
-  );
+          ...(intermediates.length > 0 ? { intermediates } : {}),
+          travelMode: "DRIVE",
+          routingPreference: "TRAFFIC_AWARE",
+          computeAlternativeRoutes:
+            options.computeAlternativeRoutes ?? intermediates.length === 0,
+          ...(options.routeModifiers ? { routeModifiers: options.routeModifiers } : {}),
+          languageCode: language === "es" ? "es" : "en-US",
+          units: "IMPERIAL",
+        }),
+        cache: "no-store",
+        signal,
+      }
+    );
+    const data = (await response.json()) as GoogleRouteResponse;
 
-  const data = (await response.json()) as GoogleRouteResponse;
+    return { response, data };
+  });
 
   if (!response.ok) {
     throw new Error(
@@ -707,14 +712,19 @@ async function getTomTomRoute(coordinates: Coordinate[], language: AppLanguage) 
     ...TOMTOM_TRUCK_QUERY_PARAMS,
   });
 
-  const response = await fetch(
-    `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json?${query}`,
-    {
-      method: "GET",
-      cache: "no-store",
-    }
-  );
-  const data = (await response.json()) as TomTomRouteResponse;
+  const { response, data } = await withProviderTimeout("tomtom", async (signal) => {
+    const response = await fetch(
+      `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json?${query}`,
+      {
+        method: "GET",
+        cache: "no-store",
+        signal,
+      }
+    );
+    const data = (await response.json()) as TomTomRouteResponse;
+
+    return { response, data };
+  });
 
   if (!response.ok) {
     throw new Error(
@@ -732,39 +742,44 @@ async function getOrsRoute(
   language: AppLanguage,
   candidateLimit: number
 ) {
-  const response = await fetch(
-    "https://api.heigit.org/openrouteservice/v2/directions/driving-hgv",
-    {
-      method: "POST",
-      headers: {
-        Authorization: process.env.OPENROUTESERVICE_API_KEY || "",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        coordinates,
-        language,
-        options: TRAILER_FRIENDLY_ORS_OPTIONS,
-        ...(candidateLimit > 1
-          ? {
-              alternative_routes: {
-                target_count: candidateLimit,
-                share_factor: 0.6,
-                weight_factor: 1.4,
-              },
-            }
-          : {}),
-      }),
-      cache: "no-store",
+  const { response, data } = await withProviderTimeout("ors", async (signal) => {
+    const response = await fetch(
+      "https://api.heigit.org/openrouteservice/v2/directions/driving-hgv",
+      {
+        method: "POST",
+        headers: {
+          Authorization: process.env.OPENROUTESERVICE_API_KEY || "",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          coordinates,
+          language,
+          options: TRAILER_FRIENDLY_ORS_OPTIONS,
+          ...(candidateLimit > 1
+            ? {
+                alternative_routes: {
+                  target_count: candidateLimit,
+                  share_factor: 0.6,
+                  weight_factor: 1.4,
+                },
+              }
+            : {}),
+        }),
+        cache: "no-store",
+        signal,
+      }
+    );
+
+    let data: unknown = null;
+
+    try {
+      data = await response.json();
+    } catch {
+      throw new Error("OpenRouteService response was not valid JSON.");
     }
-  );
 
-  let data: unknown = null;
-
-  try {
-    data = await response.json();
-  } catch {
-    throw new Error("OpenRouteService response was not valid JSON.");
-  }
+    return { response, data };
+  });
 
   if (!response.ok) {
     throw new Error(`OpenRouteService failed with status ${response.status}`);
@@ -788,12 +803,16 @@ async function getGeoapifyRoute(
     `&traffic=approximated` +
     `&apiKey=${process.env.GEOAPIFY_API_KEY}`;
 
-  const response = await fetch(url, {
-    method: "GET",
-    cache: "no-store",
-  });
+  const { response, data } = await withProviderTimeout("geoapify", async (signal) => {
+    const response = await fetch(url, {
+      method: "GET",
+      cache: "no-store",
+      signal,
+    });
+    const data = (await response.json()) as GeoapifyRouteResponse;
 
-  const data = (await response.json()) as GeoapifyRouteResponse;
+    return { response, data };
+  });
 
   if (!response.ok) {
     throw new Error(data?.error || `Geoapify routing failed with status ${response.status}`);

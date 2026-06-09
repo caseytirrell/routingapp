@@ -120,6 +120,28 @@ function replaceCurrentLegInDisplayGeometry(
   ];
 }
 
+function getStepPathRange(
+  step: RouteStep,
+  legStartIndex: number,
+  pathLength: number
+) {
+  const stepStartIndex = step.way_points?.[0];
+  const stepEndIndex = step.way_points?.[1];
+
+  if (
+    typeof stepStartIndex !== "number" ||
+    typeof stepEndIndex !== "number" ||
+    pathLength < 2
+  ) {
+    return null;
+  }
+
+  return {
+    startIndex: Math.max(0, Math.min(stepStartIndex - legStartIndex, pathLength - 1)),
+    endIndex: Math.max(0, Math.min(stepEndIndex - legStartIndex, pathLength - 1)),
+  };
+}
+
 
 export default function NavPage() {
   const router = useRouter();
@@ -188,6 +210,12 @@ export default function NavPage() {
     utterance.rate = 0.9;
     window.speechSynthesis.speak(utterance);
   }, [language]);
+
+  const cancelSpeechPrompt = useCallback(() => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+
+    window.speechSynthesis.cancel();
+  }, []);
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -832,53 +860,39 @@ export default function NavPage() {
 
   const currentSteps = currentSegment?.steps ?? [];
   const currentLegStartIndex = currentSteps?.[0]?.way_points?.[0] ?? 0;
-  const currentFullRouteIndex = currentLegStartIndex + currentLegProgressIndex;
+  const currentStepEntries = currentSteps
+    .map((step) => {
+      const range = getStepPathRange(step, currentLegStartIndex, currentLegPath.length);
+      return range ? { step, ...range } : null;
+    })
+    .filter((entry): entry is { step: RouteStep; startIndex: number; endIndex: number } =>
+      entry !== null
+    );
 
   const currentStep =
-    currentSteps.find((step: RouteStep) => {
-      const stepStartIndex = step?.way_points?.[0];
-      const stepEndIndex = step?.way_points?.[1];
-
-      if (
-        typeof stepStartIndex !== "number" ||
-        typeof stepEndIndex !== "number"
-      ) {
-        return false;
-      }
-
-      return (
-        stepStartIndex <= currentFullRouteIndex &&
-        stepEndIndex >= currentFullRouteIndex
-      );
-    }) ?? null;
+    currentStepEntries.find(
+      ({ startIndex, endIndex }) =>
+        startIndex <= currentLegProgressIndex && endIndex >= currentLegProgressIndex
+    )?.step ?? null;
 
   const currentRoadName =
     typeof currentStep?.name === "string" && currentStep.name.trim()
       ? currentStep.name
       : null;
 
-  const nextStep =
-    currentSteps.find((step: RouteStep) => {
-      const stepEndIndex = step?.way_points?.[1];
-
-      if (typeof stepEndIndex !== "number") return false;
-
-      return stepEndIndex > currentFullRouteIndex;
-    }) ?? null;
+  const nextStepEntry =
+    currentStepEntries.find(({ startIndex }) => startIndex >= currentLegProgressIndex) ?? null;
+  const nextStep = nextStepEntry?.step ?? null;
 
   const nextTurnInstruction = getStepInstructionText(nextStep);
-
-  const nextTurnEndIndex =
-    typeof nextStep?.way_points?.[1] === "number"
-      ? nextStep.way_points[1] - currentLegStartIndex
-      : null;
+  const nextTurnIndex = nextStepEntry?.startIndex ?? null;
 
   const nextTurnDistanceFeet =
-    nextTurnEndIndex !== null && currentLegPath.length > 1
+    nextTurnIndex !== null && currentLegPath.length > 1
       ? getDistanceAlongPathInFeet(
           currentLegPath,
           currentLegProgressIndex,
-          Math.max(currentLegProgressIndex, nextTurnEndIndex)
+          Math.max(currentLegProgressIndex, nextTurnIndex)
         )
       : null;
 
@@ -922,6 +936,7 @@ export default function NavPage() {
 
     try {
       setIsRerouting(true);
+      cancelSpeechPrompt();
 
       const res = await fetch("/api/reroute-leg", {
         method: "POST",
@@ -951,6 +966,8 @@ export default function NavPage() {
 
       reroutedLegIndexRef.current = currentLegIndex;
       reroutedLegOriginalSegmentRef.current = currentSegment;
+      spokenTurnThresholdsRef.current.clear();
+      spokenArrivalRef.current = null;
       setCurrentLegPath(newPath);
       setCurrentLegProgressIndex(0);
       setNavigationError("");
@@ -982,7 +999,15 @@ export default function NavPage() {
     } finally {
       setIsRerouting(false);
     }
-  }, [currentLegIndex, currentSegment, currentStopCoords, isRerouting, language, truckLocation]);
+  }, [
+    cancelSpeechPrompt,
+    currentLegIndex,
+    currentSegment,
+    currentStopCoords,
+    isRerouting,
+    language,
+    truckLocation,
+  ]);
 
   useEffect(() => {
     if (

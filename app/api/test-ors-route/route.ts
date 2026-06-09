@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { withProviderTimeout } from "@/lib/provider-timeouts";
 import { TRAILER_FRIENDLY_ORS_OPTIONS } from "@/lib/vehicle-profile";
 
 function getErrorMessage(error: unknown): string {
@@ -16,28 +17,32 @@ export async function GET() {
       );
     }
 
-    const response = await fetch(
-      "https://api.heigit.org/openrouteservice/v2/directions/driving-hgv",
-      {
-        method: "POST",
-        headers: {
-          Authorization: apiKey,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          coordinates: [
-            [-74.177646, 40.304492],
-            [-74.133873, 40.344813],
-            [-74.061588, 40.230499],
-            [-74.042879, 40.102352],
-            [-74.177646, 40.304492]
-          ],
-          options: TRAILER_FRIENDLY_ORS_OPTIONS,
-        }),
-      }
-    );
+    const { response, data } = await withProviderTimeout("ors", async (signal) => {
+      const response = await fetch(
+        "https://api.heigit.org/openrouteservice/v2/directions/driving-hgv",
+        {
+          method: "POST",
+          headers: {
+            Authorization: apiKey,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            coordinates: [
+              [-74.177646, 40.304492],
+              [-74.133873, 40.344813],
+              [-74.061588, 40.230499],
+              [-74.042879, 40.102352],
+              [-74.177646, 40.304492],
+            ],
+            options: TRAILER_FRIENDLY_ORS_OPTIONS,
+          }),
+          signal,
+        }
+      );
+      const data = await response.json();
 
-    const data = await response.json();
+      return { response, data };
+    });
 
     return NextResponse.json({
       success: response.ok,

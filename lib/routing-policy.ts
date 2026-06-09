@@ -1,4 +1,5 @@
 import { decodePolyline } from "./geo";
+import { ProviderTimeoutError, withProviderTimeout } from "./provider-timeouts";
 import { TOMTOM_TRUCK_QUERY_PARAMS } from "./vehicle-profile";
 import type {
   AppRoute,
@@ -256,21 +257,37 @@ async function assessRouteWithTomTom(
     sectionType: "traffic",
     ...TOMTOM_TRUCK_QUERY_PARAMS,
   });
-  const response = await fetch(
-    `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json?${query}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        supportingPoints: geometry.map(([longitude, latitude]) => ({
-          latitude,
-          longitude,
-        })),
-      }),
-      cache: "no-store",
+  let response: Response;
+  let data: TomTomRouteResponse;
+
+  try {
+    ({ response, data } = await withProviderTimeout("tomtom", async (signal) => {
+      const response = await fetch(
+        `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json?${query}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            supportingPoints: geometry.map(([longitude, latitude]) => ({
+              latitude,
+              longitude,
+            })),
+          }),
+          cache: "no-store",
+          signal,
+        }
+      );
+      const data = (await response.json()) as TomTomRouteResponse;
+
+      return { response, data };
+    }));
+  } catch (error) {
+    if (error instanceof ProviderTimeoutError) {
+      return createUnavailableTrafficAssessment(error.message, routeAttempt);
     }
-  );
-  const data = (await response.json()) as TomTomRouteResponse;
+
+    throw error;
+  }
 
   if (!response.ok) {
     return createUnavailableTrafficAssessment(

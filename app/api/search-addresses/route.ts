@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { withProviderTimeout } from "@/lib/provider-timeouts";
 
 type NominatimResult = {
   name?: string;
@@ -36,15 +37,22 @@ export async function GET(request: Request) {
       `&limit=8` +
       `&countrycodes=us`;
 
-    const response = await fetch(url, {
-      headers: {
-        "User-Agent": "crew-route-optimizer/1.0",
-        "Accept-Language": "en-US,en",
-      },
-      cache: "no-store",
-    });
+    const { response, data } = await withProviderTimeout(
+      "nominatim",
+      async (signal) => {
+        const response = await fetch(url, {
+          headers: {
+            "User-Agent": "crew-route-optimizer/1.0",
+            "Accept-Language": "en-US,en",
+          },
+          cache: "no-store",
+          signal,
+        });
+        const data = (await response.json()) as NominatimResult[];
 
-    const data = (await response.json()) as NominatimResult[];
+        return { response, data };
+      }
+    );
 
     if (!response.ok) {
       throw new Error(`Address lookup failed with status ${response.status}`);

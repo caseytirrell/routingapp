@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { decodePolyline } from "@/lib/geo";
 import { normalizeLanguage, type AppLanguage } from "@/lib/i18n";
+import { withProviderTimeout } from "@/lib/provider-timeouts";
 import {
   chooseRouteCandidate,
   createRouteCandidates,
@@ -310,12 +311,16 @@ async function getGeoapifyRoute(
     `&details=instruction_details` +
     `&apiKey=${process.env.GEOAPIFY_API_KEY}`;
 
-  const response = await fetch(url, {
-    method: "GET",
-    cache: "no-store",
-  });
+  const { response, data } = await withProviderTimeout("geoapify", async (signal) => {
+    const response = await fetch(url, {
+      method: "GET",
+      cache: "no-store",
+      signal,
+    });
+    const data = (await response.json()) as GeoapifyRouteResponse;
 
-  const data = (await response.json()) as GeoapifyRouteResponse;
+    return { response, data };
+  });
 
   if (!response.ok) {
     throw new Error(data?.error || `Geoapify reroute failed with status ${response.status}`);
@@ -336,43 +341,48 @@ async function getGoogleRoute(
 
   const [originLng, originLat] = coordinates[0];
   const [destinationLng, destinationLat] = coordinates[coordinates.length - 1];
-  const response = await fetch(
-    "https://routes.googleapis.com/directions/v2:computeRoutes",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": apiKey,
-        "X-Goog-FieldMask":
-          "routes.duration,routes.staticDuration,routes.distanceMeters,routes.polyline.encodedPolyline,routes.legs.duration,routes.legs.staticDuration,routes.legs.distanceMeters,routes.legs.polyline.encodedPolyline,routes.legs.steps.distanceMeters,routes.legs.steps.staticDuration,routes.legs.steps.polyline.encodedPolyline,routes.legs.steps.navigationInstruction.instructions",
-      },
-      body: JSON.stringify({
-        origin: {
-          location: {
-            latLng: {
-              latitude: originLat,
-              longitude: originLng,
+  const { response, data } = await withProviderTimeout("google", async (signal) => {
+    const response = await fetch(
+      "https://routes.googleapis.com/directions/v2:computeRoutes",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Goog-Api-Key": apiKey,
+          "X-Goog-FieldMask":
+            "routes.duration,routes.staticDuration,routes.distanceMeters,routes.polyline.encodedPolyline,routes.legs.duration,routes.legs.staticDuration,routes.legs.distanceMeters,routes.legs.polyline.encodedPolyline,routes.legs.steps.distanceMeters,routes.legs.steps.staticDuration,routes.legs.steps.polyline.encodedPolyline,routes.legs.steps.navigationInstruction.instructions",
+        },
+        body: JSON.stringify({
+          origin: {
+            location: {
+              latLng: {
+                latitude: originLat,
+                longitude: originLng,
+              },
             },
           },
-        },
-        destination: {
-          location: {
-            latLng: {
-              latitude: destinationLat,
-              longitude: destinationLng,
+          destination: {
+            location: {
+              latLng: {
+                latitude: destinationLat,
+                longitude: destinationLng,
+              },
             },
           },
-        },
-        travelMode: "DRIVE",
-        routingPreference: "TRAFFIC_AWARE",
-        computeAlternativeRoutes: false,
-        languageCode: language === "es" ? "es" : "en-US",
-        units: "IMPERIAL",
-      }),
-      cache: "no-store",
-    }
-  );
-  const data = (await response.json()) as GoogleRouteResponse;
+          travelMode: "DRIVE",
+          routingPreference: "TRAFFIC_AWARE",
+          computeAlternativeRoutes: false,
+          languageCode: language === "es" ? "es" : "en-US",
+          units: "IMPERIAL",
+        }),
+        cache: "no-store",
+        signal,
+      }
+    );
+    const data = (await response.json()) as GoogleRouteResponse;
+
+    return { response, data };
+  });
 
   if (!response.ok) {
     throw new Error(
@@ -412,27 +422,34 @@ export async function POST(request: Request) {
 
     const candidateRequests: Promise<LiveRerouteCandidateResult>[] = [];
 
-    if (process.env.OPENROUTESERVICE_API_KEY) {
+    const orsApiKey = process.env.OPENROUTESERVICE_API_KEY;
+
+    if (orsApiKey) {
       candidateRequests.push(
-        fetch("https://api.heigit.org/openrouteservice/v2/directions/driving-hgv", {
-          method: "POST",
-          headers: {
-            Authorization: process.env.OPENROUTESERVICE_API_KEY,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            coordinates: [truckLocation, destination],
-            language,
-            options: TRAILER_FRIENDLY_ORS_OPTIONS,
-            ...(typeof heading === "number"
-              ? {
-                  bearings: [[Math.round(heading), 45]],
-                  continue_straight: true,
-                }
-              : {}),
-          }),
-          cache: "no-store",
-        }).then(async (response) => {
+        withProviderTimeout("ors", async (signal) => {
+          const response = await fetch(
+            "https://api.heigit.org/openrouteservice/v2/directions/driving-hgv",
+            {
+              method: "POST",
+              headers: {
+                Authorization: orsApiKey,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                coordinates: [truckLocation, destination],
+                language,
+                options: TRAILER_FRIENDLY_ORS_OPTIONS,
+                ...(typeof heading === "number"
+                  ? {
+                      bearings: [[Math.round(heading), 45]],
+                      continue_straight: true,
+                    }
+                  : {}),
+              }),
+              cache: "no-store",
+              signal,
+            }
+          );
           const data = (await response.json()) as AppRoute;
 
           if (!response.ok) {
