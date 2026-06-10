@@ -10,10 +10,12 @@ import type {
   RouteDecisionReport,
   RouteStep,
   TrafficAssessment,
+  TrafficSection,
 } from "./route-types";
 
 const TOMTOM_TRAFFIC_THRESHOLD_RATIO = 0.25;
 const TOMTOM_MAX_SUPPORTING_POINTS = 50;
+const TOMTOM_MAX_TRAFFIC_ANNOTATION_POINTS = 200;
 const GARDEN_STATE_PARKWAY_EXIT_105_LATITUDE = 40.283611;
 const GARDEN_STATE_PARKWAY_EXIT_105_BUFFER_DEGREES = 0.002;
 
@@ -54,14 +56,35 @@ type TomTomRouteSummary = {
   liveTrafficIncidentsTravelTimeInSeconds?: number;
 };
 
+type TomTomPoint = {
+  latitude: number;
+  longitude: number;
+};
+
+type TomTomTrafficSection = {
+  sectionType?: string;
+  startPointIndex?: number;
+  endPointIndex?: number;
+  simpleCategory?: string;
+  effectiveSpeedInKmh?: number;
+  delayInSeconds?: number;
+  magnitudeOfDelay?: number;
+};
+
 type TomTomRouteResponse = {
-  routes?: {
-    summary?: TomTomRouteSummary;
-  }[];
+  routes?: TomTomRouteResult[];
   detailedError?: {
     message?: string;
   };
   error?: string;
+};
+
+type TomTomRouteResult = {
+  summary?: TomTomRouteSummary;
+  legs?: {
+    points?: TomTomPoint[];
+  }[];
+  sections?: TomTomTrafficSection[];
 };
 
 export type RouteCandidateInput = {
@@ -182,19 +205,168 @@ export function validateCommercialRestrictions(
   };
 }
 
-function sampleRouteGeometry(geometry: Coordinate[]) {
-  if (geometry.length <= TOMTOM_MAX_SUPPORTING_POINTS) return geometry;
+function sampleRouteGeometry(
+  geometry: Coordinate[],
+  maxSupportingPoints = TOMTOM_MAX_SUPPORTING_POINTS
+) {
+  if (geometry.length <= maxSupportingPoints) return geometry;
 
   const sampled: Coordinate[] = [];
   const lastIndex = geometry.length - 1;
 
-  for (let index = 0; index < TOMTOM_MAX_SUPPORTING_POINTS; index++) {
+  for (let index = 0; index < maxSupportingPoints; index++) {
     sampled.push(
-      geometry[Math.round((index / (TOMTOM_MAX_SUPPORTING_POINTS - 1)) * lastIndex)]
+      geometry[Math.round((index / (maxSupportingPoints - 1)) * lastIndex)]
     );
   }
 
   return sampled;
+}
+
+function getTomTomRoutePoints(route: TomTomRouteResult): Coordinate[] {
+  const points: Coordinate[] = [];
+
+  for (const leg of route.legs ?? []) {
+    for (const point of leg.points ?? []) {
+      const coordinate: Coordinate = [point.longitude, point.latitude];
+      const previous = points[points.length - 1];
+
+      if (previous && previous[0] === coordinate[0] && previous[1] === coordinate[1]) {
+        continue;
+      }
+
+      points.push(coordinate);
+    }
+  }
+
+  return points;
+}
+
+function toTrafficSections(route: TomTomRouteResult): TrafficSection[] {
+  const points = getTomTomRoutePoints(route);
+
+  if (points.length < 2) return [];
+
+  return (route.sections ?? [])
+    .filter(
+      (section) =>
+        section.sectionType === "TRAFFIC" &&
+        typeof section.startPointIndex === "number" &&
+        typeof section.endPointIndex === "number"
+    )
+    .map((section) => {
+      const startPointIndex = Math.max(
+        0,
+        Math.min(section.startPointIndex ?? 0, points.length - 1)
+      );
+      const endPointIndex = Math.max(
+        startPointIndex,
+        Math.min(section.endPointIndex ?? startPointIndex, points.length - 1)
+      );
+
+      return {
+        provider: "tomtom" as const,
+        geometry: points.slice(startPointIndex, endPointIndex + 1),
+        startPointIndex,
+        endPointIndex,
+        delaySeconds:
+          typeof section.delayInSeconds === "number" ? section.delayInSeconds : null,
+        magnitudeOfDelay:
+          typeof section.magnitudeOfDelay === "number" ? section.magnitudeOfDelay : null,
+        simpleCategory:
+          typeof section.simpleCategory === "string" ? section.simpleCategory : null,
+        effectiveSpeedKmh:
+          typeof section.effectiveSpeedInKmh === "number"
+            ? section.effectiveSpeedInKmh
+            : null,
+      };
+    })
+    .filter((section) => section.geometry.length > 1);
+}
+
+export async function annotateRouteTrafficSections(
+  routeData: AppRoute
+): Promise<AppRoute> {
+  const apiKey = process.env.TOMTOM_API_KEY;
+  const selectedRoute = routeData.routes?.[0];
+
+  if (!apiKey || !selectedRoute) {
+    return routeData;
+  }
+
+  const geometry = sampleRouteGeometry(
+    getRouteGeometry(selectedRoute),
+    TOMTOM_MAX_TRAFFIC_ANNOTATION_POINTS
+  );
+
+  if (geometry.length < 2) {
+    return routeData;
+  }
+
+  const origin = geometry[0];
+  const destination = geometry[geometry.length - 1];
+  const locations = `${origin[1]},${origin[0]}:${destination[1]},${destination[0]}`;
+  const query = new URLSearchParams({
+    key: apiKey,
+    traffic: "true",
+    routeRepresentation: "polyline",
+    computeTravelTimeFor: "all",
+    sectionType: "traffic",
+    ...TOMTOM_TRUCK_QUERY_PARAMS,
+  });
+
+  try {
+    const { response, data } = await withProviderTimeout("tomtom", async (signal) => {
+      const response = await fetch(
+        `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json?${query}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            supportingPoints: geometry.map(([longitude, latitude]) => ({
+              latitude,
+              longitude,
+            })),
+          }),
+          cache: "no-store",
+          signal,
+        }
+      );
+      const data = (await response.json()) as TomTomRouteResponse;
+
+      return { response, data };
+    });
+
+    if (!response.ok) {
+      console.log(
+        "TomTom traffic section annotation failed:",
+        data.detailedError?.message ||
+          data.error ||
+          `TomTom traffic section request failed with status ${response.status}.`
+      );
+      return routeData;
+    }
+
+    const trafficSections = toTrafficSections(data.routes?.[0] ?? {});
+
+    return {
+      ...routeData,
+      routes: routeData.routes.map((route, index) =>
+        index === 0
+          ? {
+              ...route,
+              trafficSections,
+            }
+          : route
+      ),
+    };
+  } catch (error) {
+    console.log(
+      "TomTom traffic section annotation failed:",
+      error instanceof Error ? error.message : "Unknown error"
+    );
+    return routeData;
+  }
 }
 
 function createUnavailableTrafficAssessment(

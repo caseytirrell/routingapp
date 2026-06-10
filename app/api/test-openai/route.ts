@@ -4,6 +4,7 @@ import { decodePolyline } from "@/lib/geo";
 import { normalizeLanguage, type AppLanguage } from "@/lib/i18n";
 import { withProviderTimeout } from "@/lib/provider-timeouts";
 import {
+  annotateRouteTrafficSections,
   chooseRouteCandidate as chooseValidatedRouteCandidate,
   createRouteCandidates as createValidatedRouteCandidates,
 } from "@/lib/routing-policy";
@@ -1220,6 +1221,8 @@ export async function POST(request: Request) {
         routeDecision = selectedRoute.routeDecision;
       }
     }
+
+    routeData = await annotateRouteTrafficSections(routeData);
 
     return NextResponse.json({
       success: true,

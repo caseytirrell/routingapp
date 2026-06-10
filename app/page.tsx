@@ -14,6 +14,9 @@ import {
   type AppLanguage,
 } from "@/lib/i18n";
 import { nurseryStop, properties, startCoordsMap } from "@/lib/stops";
+import {
+  getTrafficSectionsFeatureCollection,
+} from "@/lib/traffic-display";
 import type {
   AppRoute,
   Coordinate,
@@ -400,6 +403,7 @@ export default function Home() {
     const existingFullSource = map.getSource("route") as maplibregl.GeoJSONSource | undefined;
     const existingDrivenSource = map.getSource("driven-leg") as maplibregl.GeoJSONSource | undefined;
     const existingRemainingSource = map.getSource("remaining-leg") as maplibregl.GeoJSONSource | undefined;
+    const existingTrafficSource = map.getSource("traffic-sections") as maplibregl.GeoJSONSource | undefined;
 
     if (existingFullSource) {
       existingFullSource.setData(fullRouteGeoJson);
@@ -476,12 +480,45 @@ export default function Home() {
       });
     }
 
+    const trafficGeoJson = getTrafficSectionsFeatureCollection(
+      orsRoute.routes[0].trafficSections ?? []
+    );
+
+    if (existingTrafficSource) {
+      existingTrafficSource.setData(trafficGeoJson);
+    } else {
+      map.addSource("traffic-sections", {
+        type: "geojson",
+        data: trafficGeoJson,
+      });
+
+      map.addLayer({
+        id: "traffic-sections-line",
+        type: "line",
+        source: "traffic-sections",
+        layout: {
+          "line-cap": "round",
+          "line-join": "round",
+        },
+        paint: {
+          "line-color": ["get", "color"],
+          "line-width": 8,
+          "line-opacity": 0.74,
+          "line-blur": 1.5,
+        },
+      });
+    }
+
     if (map.getLayer("driven-leg-line")) {
       map.moveLayer("driven-leg-line");
     }
 
     if (map.getLayer("remaining-leg-line")) {
       map.moveLayer("remaining-leg-line");
+    }
+
+    if (map.getLayer("traffic-sections-line")) {
+      map.moveLayer("traffic-sections-line");
     }
 
     const bounds = new maplibregl.LngLatBounds();

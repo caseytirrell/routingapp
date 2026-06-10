@@ -3,6 +3,7 @@ import { decodePolyline } from "@/lib/geo";
 import { normalizeLanguage, type AppLanguage } from "@/lib/i18n";
 import { withProviderTimeout } from "@/lib/provider-timeouts";
 import {
+  annotateRouteTrafficSections,
   chooseRouteCandidate,
   createRouteCandidates,
   type RouteCandidateInput,
@@ -512,9 +513,11 @@ export async function POST(request: Request) {
       scoreAllCandidates: true,
     });
 
+    const annotatedRouteData = await annotateRouteTrafficSections(selectedRoute.routeData);
+
     return NextResponse.json({
       success: true,
-      orsRoute: selectedRoute.routeData,
+      orsRoute: annotatedRouteData,
       trafficAssessment: selectedRoute.trafficAssessment,
       routeDecision: selectedRoute.routeDecision,
     });

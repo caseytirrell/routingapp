@@ -41,9 +41,21 @@ export type RouteSegment = {
   steps?: RouteStep[];
 };
 
+export type TrafficSection = {
+  provider: "tomtom";
+  geometry: Coordinate[];
+  startPointIndex: number;
+  endPointIndex: number;
+  delaySeconds: number | null;
+  magnitudeOfDelay: number | null;
+  simpleCategory: string | null;
+  effectiveSpeedKmh: number | null;
+};
+
 export type Route = {
   geometry: string | Coordinate[];
   segments?: RouteSegment[];
+  trafficSections?: TrafficSection[];
   distance?: number;
   duration?: number;
   time?: number;
